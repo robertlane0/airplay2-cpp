@@ -32,23 +32,226 @@
 // machinery). We send the classic iTunes/OwnTone form instead, ONE
 // RECORD with Range + Session + RTP-Info, which is what RAOP receivers
 // have parsed since 2004 and strictly more conventional.
+//
+// ROADMAP.md m1: this file used to talk to QTcpSocket/QUdpSocket/QTimer
+// directly. It now only ever touches `ITransport` (transport.h) -- every
+// QByteArray/QString/QHash/QList became std::string/std::map/std::vector,
+// every signal became a std::function member, every QTimer became an
+// ITransport::every()/after() registration. The protocol logic below is
+// otherwise unchanged from the version that runs in FXChainPlayer today.
 
 #include "raop_sender.h"
 #include "airplay_crypto.h"
-#include "../common/logger.h"   // host glue (ROADMAP m2); not in this repo yet
+#include "logger.h"
 #include "ring_buffer.h"
 
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QRandomGenerator>
-#include <QUuid>
-#include <QtEndian>
-
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <optional>
 
 namespace fxchain {
+
+namespace {
+
+using airplay::Bytes;
+
+constexpr int      kFramesPerPacket   = 352;          // RAOP fixed
+constexpr uint32_t kRaopRate          = 44100;        // RAOP fixed
+constexpr int      kChannels          = 2;
+constexpr int      kPayloadBytes      = kFramesPerPacket * kChannels * 2;
+constexpr int      kBacklogSize       = 1024;         // power of two
+constexpr int      kPacerMs           = 8;            // ≈ 1 packet/tick
+constexpr int      kMaxPacketsPerTick = 16;           // stall catch-up cap
+constexpr int      kHandshakeTimeoutMs = 10000;
+constexpr int      kPinWaitTimeoutMs   = 180000;      // 3 min, read a code off the TV
+constexpr int      kFeedbackIntervalMs = 25000;       // pyatv KEEP_ALIVE_INTERVAL
+// Cap the resampler's staging buffer (frames). ~0.2 s at 48 kHz, the
+// engine ring itself is the deep buffer; this is just working set.
+constexpr size_t   kInBufMaxFrames = 8192;
+
+// Big-endian appenders (RTP family is network byte order throughout).
+void b8(std::string& out, uint8_t v) { out += char(v); }
+void be16(std::string& out, uint16_t v) {
+    out += char(v >> 8); out += char(v & 0xFF);
+}
+void be32(std::string& out, uint32_t v) {
+    out += char(v >> 24); out += char((v >> 16) & 0xFF);
+    out += char((v >> 8) & 0xFF); out += char(v & 0xFF);
+}
+
+// pyatv timing.py, NTP <-> RTP-timestamp conversion.
+uint64_t ntp2ts(uint64_t ntp, uint32_t rate) { return ((ntp >> 16) * rate) >> 16; }
+uint64_t ts2ntp(uint64_t ts, uint32_t rate)  { return ((ts << 16) / rate) << 16; }
+
+// v0.66.x, std::string <-> airplay::Bytes bridges (the crypto layer is
+// Qt-free std::vector<uint8_t>; the wire layer is std::string, replacing
+// the old QByteArray <-> airplay::Bytes bridge of the same shape).
+Bytes toBytes(const std::string& s) { return Bytes(s.begin(), s.end()); }
+std::string fromBytes(const Bytes& b) {
+    return std::string(reinterpret_cast<const char*>(b.data()), b.size());
+}
+
+// ── tiny helpers that used to be QByteArray/QString/QRandomGenerator/QUuid
+//    member functions. Random bytes reuse airplay_crypto's CTR-DRBG rather
+//    than pulling in a second RNG. ──────────────────────────────────────
+uint32_t randU32() {
+    const Bytes b = airplay::randomBytes(4);
+    return (uint32_t(b[0]) << 24) | (uint32_t(b[1]) << 16)
+         | (uint32_t(b[2]) << 8)  |  uint32_t(b[3]);
+}
+uint64_t randU64() {
+    const Bytes b = airplay::randomBytes(8);
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v = (v << 8) | b[size_t(i)];
+    return v;
+}
+uint16_t randU16() { return uint16_t(randU32() & 0xFFFF); }
+
+// RFC 4122 v4 UUID, lowercase, no braces (QUuid::toString(WithoutBraces)).
+std::string makeUuid() {
+    Bytes b = airplay::randomBytes(16);
+    b[6] = uint8_t((b[6] & 0x0F) | 0x40);   // version 4
+    b[8] = uint8_t((b[8] & 0x3F) | 0x80);   // variant 10xx
+    static const char* hex = "0123456789abcdef";
+    std::string s; s.reserve(36);
+    for (int i = 0; i < 16; ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) s += '-';
+        s += hex[b[size_t(i)] >> 4];
+        s += hex[b[size_t(i)] & 0xF];
+    }
+    return s;
+}
+std::string toUpperStr(std::string s) {
+    for (auto& c : s) c = char(std::toupper(static_cast<unsigned char>(c)));
+    return s;
+}
+std::string toLowerStr(std::string s) {
+    for (auto& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+std::string trimmed(const std::string& s) {
+    const size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return {};
+    const size_t e = s.find_last_not_of(" \t\r\n");
+    return s.substr(b, e - b + 1);
+}
+std::vector<std::string> splitStr(const std::string& s, char delim) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    for (;;) {
+        const size_t pos = s.find(delim, start);
+        if (pos == std::string::npos) { out.push_back(s.substr(start)); break; }
+        out.push_back(s.substr(start, pos - start));
+        start = pos + 1;
+    }
+    return out;
+}
+std::string atOr(const std::vector<std::string>& v, size_t i, const std::string& def = {}) {
+    return i < v.size() ? v[i] : def;
+}
+// QByteArray::toInt(&ok) equivalent: the WHOLE string must be a valid base-10
+// integer or `ok` comes back false (and 0 is returned).
+long toIntChecked(const std::string& s, bool* ok) {
+    if (s.empty()) { if (ok) *ok = false; return 0; }
+    char* end = nullptr;
+    const long v = std::strtol(s.c_str(), &end, 10);
+    const bool good = end != nullptr && *end == '\0';
+    if (ok) *ok = good;
+    return good ? v : 0;
+}
+int toIntOr0(const std::string& s) { return int(toIntChecked(s, nullptr)); }
+unsigned toUIntOr0(const std::string& s) {
+    if (s.empty()) return 0;
+    char* end = nullptr;
+    const unsigned long v = std::strtoul(s.c_str(), &end, 10);
+    return end == s.c_str() ? 0u : unsigned(v);
+}
+// Fixed 6-decimal-place formatting (QByteArray::number(double,'f',6)).
+std::string fixed6(double v) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.6f", v);
+    return buf;
+}
+// Uppercase hex of a 64-bit value, no zero-padding
+// (QByteArray::number(v,16).toUpper()).
+std::string hexUpperNoPad(uint64_t v) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%llX", static_cast<unsigned long long>(v));
+    return buf;
+}
+std::string toHex(const Bytes& b) {
+    static const char* hex = "0123456789abcdef";
+    std::string s; s.reserve(b.size() * 2);
+    for (uint8_t byte : b) { s += hex[byte >> 4]; s += hex[byte & 0xF]; }
+    return s;
+}
+// Lenient: {} on malformed input rather than throwing (matches
+// QByteArray::fromHex's "best effort" behaviour closely enough -- the
+// callers here only ever treat the result as valid if its SIZE is right).
+Bytes fromHexLenient(const std::string& s) {
+    if (s.size() % 2) return {};
+    Bytes out; out.reserve(s.size() / 2);
+    auto val = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < s.size(); i += 2) {
+        const int hi = val(s[i]), lo = val(s[i + 1]);
+        if (hi < 0 || lo < 0) return {};
+        out.push_back(uint8_t((hi << 4) | lo));
+    }
+    return out;
+}
+std::string headerValue(const std::map<std::string, std::string>& h,
+                        const std::string& key, const std::string& def = {}) {
+    const auto it = h.find(key);
+    return it == h.end() ? def : it->second;
+}
+
+// A fixed 4-key flat JSON object -- {"ltsk":"<hex>","ltpk":"<hex>",
+// "atvId":"<hex>","clientId":"<uuid>"} -- hand-rolled (no JSON library)
+// since the schema never changes and every value is a plain hex/UUID
+// string with nothing that needs escaping. Replaces the old
+// QJsonDocument/QJsonObject round-trip of the same 4 fields.
+std::string encodeCreds(const std::string& ltskHex, const std::string& ltpkHex,
+                        const std::string& atvIdHex, const std::string& clientId) {
+    return "{\"ltsk\":\"" + ltskHex + "\",\"ltpk\":\"" + ltpkHex +
+           "\",\"atvId\":\"" + atvIdHex + "\",\"clientId\":\"" + clientId + "\"}";
+}
+// Fetch the string value for a top-level "key":"value" pair. Handles only
+// what encodeCreds() above produces (no nesting, no escapes) -- this is a
+// self-consistency parser, not a general JSON reader.
+std::optional<std::string> jsonStringValue(const std::string& json, const std::string& key) {
+    const std::string needle = "\"" + key + "\"";
+    const size_t k = json.find(needle);
+    if (k == std::string::npos) return std::nullopt;
+    const size_t colon = json.find(':', k + needle.size());
+    if (colon == std::string::npos) return std::nullopt;
+    const size_t q1 = json.find('"', colon + 1);
+    if (q1 == std::string::npos) return std::nullopt;
+    const size_t q2 = json.find('"', q1 + 1);
+    if (q2 == std::string::npos) return std::nullopt;
+    return json.substr(q1 + 1, q2 - q1 - 1);
+}
+
+// DMAP tag: 4-char ASCII code + 4-byte big-endian length + payload.
+std::string dmapTag(const char code[5], const std::string& payload) {
+    std::string t(code, 4);
+    t += char((payload.size() >> 24) & 0xFF);
+    t += char((payload.size() >> 16) & 0xFF);
+    t += char((payload.size() >> 8) & 0xFF);
+    t += char(payload.size() & 0xFF);
+    t += payload;
+    return t;
+}
+
+} // namespace
 
 // ── v0.66.x Phase 2/3, AirPlay-2 pairing + encryption session state ───
 //
@@ -90,182 +293,96 @@ struct RaopAp2State {
     bool encryptAudio = false;
 
     // AP2 SETUP bookkeeping.
-    QString sessionUuid;
-    QString streamConnId;
-    quint16 eventPort = 0;
+    std::string sessionUuid;
+    std::string streamConnId;
+    uint16_t eventPort = 0;
 
     RaopAp2State() {
-        sessionUuid = QUuid::createUuid().toString(QUuid::WithoutBraces).toUpper();
-        streamConnId = QString::number(QRandomGenerator::global()->generate64());
+        sessionUuid  = toUpperStr(makeUuid());
+        streamConnId = std::to_string(randU64());
     }
 };
 
-namespace {
-
-constexpr int      kFramesPerPacket = 352;          // RAOP fixed
-constexpr uint32_t kRaopRate        = 44100;        // RAOP fixed
-constexpr int      kChannels        = 2;
-constexpr int      kPayloadBytes    = kFramesPerPacket * kChannels * 2;
-constexpr int      kBacklogSize     = 1024;         // power of two
-constexpr int      kPacerMs         = 8;            // ≈ 1 packet/tick
-constexpr int      kMaxPacketsPerTick = 16;         // GUI-stall catch-up cap
-constexpr int      kHandshakeTimeoutMs = 10000;
-constexpr int      kPinWaitTimeoutMs  = 180000;     // 3 min, read a code off the TV
-constexpr int      kFeedbackIntervalMs = 25000;     // pyatv KEEP_ALIVE_INTERVAL
-// Cap the resampler's staging buffer (frames). ~0.2 s at 48 kHz, the
-// engine ring itself is the deep buffer; this is just working set.
-constexpr size_t   kInBufMaxFrames  = 8192;
-
-// Big-endian appenders (RTP family is network byte order throughout).
-// b8 takes a runtime quint8 so high-bit protocol constants (0x80/0xD4/…)
-// don't trip MSVC C4310 (constant-value truncation in a char cast).
-void b8(QByteArray& out, quint8 v) { out += char(v); }
-void be16(QByteArray& out, quint16 v) {
-    out += char(v >> 8); out += char(v & 0xFF);
-}
-void be32(QByteArray& out, quint32 v) {
-    out += char(v >> 24); out += char((v >> 16) & 0xFF);
-    out += char((v >> 8) & 0xFF); out += char(v & 0xFF);
-}
-
-// pyatv timing.py, NTP <-> RTP-timestamp conversion.
-quint64 ntp2ts(quint64 ntp, uint32_t rate) {
-    return ((ntp >> 16) * rate) >> 16;
-}
-quint64 ts2ntp(quint64 ts, uint32_t rate) {
-    return ((ts << 16) / rate) << 16;
-}
-
-// v0.66.x, QByteArray <-> airplay::Bytes bridges (the crypto layer is
-// Qt-free std::vector<uint8_t>; the wire layer is QByteArray).
-airplay::Bytes toBytes(const QByteArray& b) {
-    return airplay::Bytes(b.constData(),
-                          b.constData() + b.size());
-}
-QByteArray toQB(const airplay::Bytes& b) {
-    return QByteArray(reinterpret_cast<const char*>(b.data()), int(b.size()));
-}
-
-} // namespace
-
-RaopSender::RaopSender(QObject* parent) : QObject(parent) {
+RaopSender::RaopSender(ITransport& transport) : transport_(transport) {
     backlog_.resize(kBacklogSize);
     backlogSeq_.assign(kBacklogSize, -1);
-
-    connect(&rtsp_, &QTcpSocket::connected, this, [this]() {
-        if (state_ != State::Connecting) return;
-        Log::info("Cast: RAOP RTSP connected to {}:{}",
-                  host_.toStdString(), rtsp_.peerPort());
-        // v0.66.x Phase 2/3, run the auth/pairing chain first; for plain
-        // Phase-1 receivers it falls straight through to OPTIONS.
-        beginAuthChain_();
-    });
-    connect(&rtsp_, &QTcpSocket::readyRead,
-            this, &RaopSender::onRtspReadyRead_);
-    connect(&rtsp_, &QTcpSocket::disconnected, this, [this]() {
-        if (state_ == State::Idle) return;   // our own stop(), quiet
-        const bool wasStarting = state_ != State::Streaming;
-        state_ = State::Idle;
-        pacer_.stop(); syncTimer_.stop(); timeout_.stop(); pinTimeout_.stop();
-        feedbackTimer_.stop();
-        if (wasStarting)
-            emit launched(false, tr("Connection closed by the device"));
-        emit closed();
-    });
-    connect(&rtsp_,
-            qOverload<QAbstractSocket::SocketError>(&QTcpSocket::errorOccurred),
-            this, [this](QAbstractSocket::SocketError) {
-        if (state_ != State::Idle)
-            fail_(rtsp_.errorString());
-    });
-
-    connect(&controlSock_, &QUdpSocket::readyRead,
-            this, &RaopSender::onControlDatagram_);
-    connect(&timingSock_, &QUdpSocket::readyRead,
-            this, &RaopSender::onTimingDatagram_);
-    // #90, AP2 event channel: drain (and discard) receiver→sender events; the
-    // connection only needs to exist for RECORD to be accepted.
-    connect(&eventSock_, &QTcpSocket::readyRead, this,
-            &RaopSender::onEventReadyRead_);
-    // Surface an event-channel drop instead of silently ignoring it
-    // (a receiver that drops the event channel usually tears down the session).
-    connect(&eventSock_, &QTcpSocket::errorOccurred, this,
-            [this](QAbstractSocket::SocketError) {
-                if (state_ == State::Streaming || state_ == State::Handshake)
-                    Log::warn("Cast: AirPlay 2 event channel error: {}",
-                              eventSock_.errorString().toStdString());
-            });
-
-    // 8 ms PRECISE pacer, Qt's default coarse timer has 5 % slack,
-    // which at 125 ticks/s would wander audibly against the 44.1 kHz
-    // budget; the token bucket in onPacerTick_ absorbs the remainder.
-    pacer_.setInterval(kPacerMs);
-    pacer_.setTimerType(Qt::PreciseTimer);
-    connect(&pacer_, &QTimer::timeout, this, &RaopSender::onPacerTick_);
-
-    syncTimer_.setInterval(1000);
-    connect(&syncTimer_, &QTimer::timeout, this,
-            [this]() { sendSyncPacket_(false); });
-
-    timeout_.setSingleShot(true);
-    timeout_.setInterval(kHandshakeTimeoutMs);
-    connect(&timeout_, &QTimer::timeout, this, [this]() {
-        // v0.66.x, a PIN wait is user-driven; pinTimeout_ guards that.
-        if (waitingForPin_) return;
-        if (state_ == State::Connecting || state_ == State::Pairing
-            || state_ == State::Handshake) {
-            // #150 diag, name WHERE the handshake stalled. The MacBook
-            // (hap-transient, sf=0x4) stalls at stage Ap2Session: the session
-            // SETUP gets no reply, while the Apple TV (hap-pin) proceeds.
-            Log::warn("Cast: AirPlay handshake TIMEOUT, state={} pairStage={} "
-                      "(receiver sent no usable reply)",
-                      static_cast<int>(state_), static_cast<int>(pairStage_));
-            fail_(tr("Timed out waiting for the device"));
-        }
-    });
-
-    // v0.66.x, the on-screen-PIN wait gets its OWN (generous) watchdog so a
-    // device that never shows a code (Apple TV asleep / TV on another input)
-    // can't leave the session stuck on "waiting for code" forever.
-    pinTimeout_.setSingleShot(true);
-    pinTimeout_.setInterval(kPinWaitTimeoutMs);
-    connect(&pinTimeout_, &QTimer::timeout, this, [this]() {
-        if (!waitingForPin_) return;
-        waitingForPin_ = false;
-        fail_(tr("No PIN was entered. Switch %1 on and make sure its screen "
-                 "shows the AirPlay code, then try again.").arg(name_));
-    });
-
-    feedbackTimer_.setInterval(kFeedbackIntervalMs);
-    connect(&feedbackTimer_, &QTimer::timeout, this, [this]() {
-        if (state_ != State::Streaming) return;
-        if (airplay2_) {
-            // #90/#109, AP2 keep-alive: a post-RECORD Apple TV closes the
-            // session after ~30 s without a VALID feedback request. The control
-            // channel is RTSP, not HTTP, owntone/pyatv send `POST /feedback
-            // RTSP/1.0` with the standard RTSP identity headers (CSeq /
-            // DACP-ID / Active-Remote / Client-Instance). An `HTTP/1.1` line is
-            // silently ignored by the receiver's RTSP parser, so its liveness
-            // timer never resets and it drops at 30 s. Empty body; the 200 reply
-            // is matched by FIFO + discarded (handleResponse_ FEEDBACK no-op).
-            QByteArray req = "POST /feedback RTSP/1.0\r\n";
-            req += "CSeq: " + QByteArray::number(cseq_++) + "\r\n";
-            req += "User-Agent: AirPlay/550.10\r\n";
-            req += "DACP-ID: " + dacpId_ + "\r\n";
-            req += "Active-Remote: " + QByteArray::number(activeRemote_) + "\r\n";
-            req += "Client-Instance: " + dacpId_ + "\r\n";
-            req += "Content-Length: 0\r\n\r\n";
-            pendingMethods_.append(QByteArrayLiteral("FEEDBACK"));
-            pendingIsHttp_.append(false);   // ignored by handleResponse_
-            writeRtsp_(req);
-        } else {
-            sendRequest_(QByteArrayLiteral("POST"),
-                         QByteArrayLiteral("/feedback"), {}, {});
-        }
-    });
 }
 
-RaopSender::~RaopSender() = default;
+RaopSender::~RaopSender() {
+    // Unlike the old QObject version, nothing here is destroyed for us --
+    // handles are plain ints the transport owns -- so make sure every
+    // socket and timer this session opened actually gets torn down.
+    stop();
+}
+
+// ── timers (ITransport::every()/after(), see transport.h) ────────────
+
+void RaopSender::startRepeating_(int& id, int ms, std::function<void()> fn) {
+    if (id != -1) transport_.cancel(id);
+    id = transport_.every(ms, std::move(fn));
+}
+void RaopSender::startOneShot_(int& id, int ms, std::function<void()> fn) {
+    if (id != -1) transport_.cancel(id);
+    id = transport_.after(ms, std::move(fn));
+}
+void RaopSender::stopTimer_(int& id) {
+    if (id != -1) { transport_.cancel(id); id = -1; }
+}
+void RaopSender::startHandshakeTimeout_() {
+    startOneShot_(handshakeTimeoutId_, kHandshakeTimeoutMs, [this] { onHandshakeTimeout_(); });
+}
+
+void RaopSender::onHandshakeTimeout_() {
+    handshakeTimeoutId_ = -1;   // one-shot: the transport already forgot it
+    // v0.66.x, a PIN wait is user-driven; pinTimeoutId_ guards that.
+    if (waitingForPin_) return;
+    if (state_ == State::Connecting || state_ == State::Pairing || state_ == State::Handshake) {
+        // #150 diag, name WHERE the handshake stalled. The MacBook
+        // (hap-transient, sf=0x4) stalls at stage Ap2Session: the session
+        // SETUP gets no reply, while the Apple TV (hap-pin) proceeds.
+        Log::warn("Cast: AirPlay handshake TIMEOUT, state={} pairStage={} "
+                  "(receiver sent no usable reply)",
+                  static_cast<int>(state_), static_cast<int>(pairStage_));
+        fail_("Timed out waiting for the device");
+    }
+}
+
+// v0.66.x, the on-screen-PIN wait gets its OWN (generous) watchdog so a
+// device that never shows a code (Apple TV asleep / TV on another input)
+// can't leave the session stuck on "waiting for code" forever.
+void RaopSender::onPinWaitTimeout_() {
+    pinTimeoutId_ = -1;
+    if (!waitingForPin_) return;
+    waitingForPin_ = false;
+    fail_(Log::format("No PIN was entered. Switch {} on and make sure its screen "
+                      "shows the AirPlay code, then try again.", name_));
+}
+
+void RaopSender::onFeedbackTick_() {
+    if (state_ != State::Streaming) return;
+    if (airplay2_) {
+        // #90/#109, AP2 keep-alive: a post-RECORD Apple TV closes the
+        // session after ~30 s without a VALID feedback request. The control
+        // channel is RTSP, not HTTP, owntone/pyatv send `POST /feedback
+        // RTSP/1.0` with the standard RTSP identity headers (CSeq /
+        // DACP-ID / Active-Remote / Client-Instance). An `HTTP/1.1` line is
+        // silently ignored by the receiver's RTSP parser, so its liveness
+        // timer never resets and it drops at 30 s. Empty body; the 200 reply
+        // is matched by FIFO + discarded (handleResponse_ FEEDBACK no-op).
+        std::string req = "POST /feedback RTSP/1.0\r\n";
+        req += "CSeq: " + std::to_string(cseq_++) + "\r\n";
+        req += "User-Agent: AirPlay/550.10\r\n";
+        req += "DACP-ID: " + dacpId_ + "\r\n";
+        req += "Active-Remote: " + std::to_string(activeRemote_) + "\r\n";
+        req += "Client-Instance: " + dacpId_ + "\r\n";
+        req += "Content-Length: 0\r\n\r\n";
+        pendingMethods_.push_back("FEEDBACK");
+        pendingIsHttp_.push_back(false);   // ignored by handleResponse_
+        writeRtsp_(req);
+    } else {
+        sendRequest_("POST", "/feedback", {}, {});
+    }
+}
 
 void RaopSender::setInputFormat(uint32_t sampleRate) {
     // 0 = no device open yet, assume the WASAPI default like the
@@ -273,9 +390,8 @@ void RaopSender::setInputFormat(uint32_t sampleRate) {
     inputRate_ = sampleRate > 0 ? sampleRate : 48000;
 }
 
-void RaopSender::setAuth(RaopDeviceInfo::Auth auth, bool airplay2,
-                         const QByteArray& deviceId, const QString& credsJson,
-                         const QString& password) {
+void RaopSender::setAuth(Auth auth, bool airplay2, const std::string& deviceId,
+                         const std::string& credsJson, const std::string& password) {
     authMethod_     = auth;
     airplay2_       = airplay2;
     deviceId_       = deviceId;
@@ -285,37 +401,34 @@ void RaopSender::setAuth(RaopDeviceInfo::Auth auth, bool airplay2,
 
 // pyatv timing.ntp_now(): microsecond wall clock in 64-bit NTP format
 // (seconds since 1900 in the high word, 2^32-scaled fraction below).
-quint64 RaopSender::ntpNow_() {
+uint64_t RaopSender::ntpNow_() {
     using namespace std::chrono;
-    const quint64 us = quint64(duration_cast<microseconds>(
+    const uint64_t us = uint64_t(duration_cast<microseconds>(
         system_clock::now().time_since_epoch()).count());
-    const quint64 sec  = us / 1000000ULL;
-    const quint64 frac = us % 1000000ULL;
+    const uint64_t sec  = us / 1000000ULL;
+    const uint64_t frac = us % 1000000ULL;
     return ((sec + 0x83AA7E80ULL) << 32) | ((frac << 32) / 1000000ULL);
 }
 
-quint32 RaopSender::rtptime32_() const {
+uint32_t RaopSender::rtptime32_() const {
     // pyatv StreamContext.rtptime: head_ts - (start_ts - latency),
     // the huge NTP-derived base cancels, so this starts at `latency`
     // and advances one per frame sent. u32 wrap is the RTP norm.
-    return quint32(quint64(latency_) + framesSent_);
+    return uint32_t(uint64_t(latency_) + framesSent_);
 }
 
-void RaopSender::start(const QString& host, quint16 port, const QString& name) {
+void RaopSender::start(const std::string& host, uint16_t port, const std::string& name) {
     stop();
     host_ = host;
     name_ = name;
-    hostAddr_ = QHostAddress(host);
 
     // Fresh session identity (pyatv: random session id reused as the
     // RTSP URI path AND the RTP SSRC; DACP-ID/Active-Remote identify
     // us to remote-control-capable receivers).
-    auto* rng = QRandomGenerator::global();
-    sessionId_    = rng->generate();
-    dacpId_       = QByteArray::number(qulonglong(rng->generate64()), 16)
-                        .toUpper();
-    activeRemote_ = rng->generate();
-    seq_          = quint16(rng->bounded(65536));
+    sessionId_    = randU32();
+    dacpId_       = hexUpperNoPad(randU64());
+    activeRemote_ = randU32();
+    seq_          = randU16();
     cseq_ = 0;
     rxBuf_.clear();
     // #90, fresh connection starts with a PLAINTEXT control channel; it flips
@@ -329,6 +442,7 @@ void RaopSender::start(const QString& host, quint16 port, const QString& name) {
     eventEncBuf_.clear();
     eventPlainBuf_.clear();
     pendingMethods_.clear();
+    pendingIsHttp_.clear();
     rtspSession_.clear();
     framesSent_ = 0;
     firstAudio_ = true;
@@ -344,7 +458,6 @@ void RaopSender::start(const QString& host, quint16 port, const QString& name) {
     waitingForPin_   = false;
     triedTransientAfterPin403_ = false;
     inHttpMode_      = false;
-    pendingIsHttp_.clear();
     digestRealm_.clear();
     digestNonce_.clear();
     pendingDigestMethod_.clear();
@@ -352,78 +465,96 @@ void RaopSender::start(const QString& host, quint16 port, const QString& name) {
     digestRetried_   = false;
 
     // Bind the UDP trio BEFORE SETUP, the request advertises our
-    // control/timing ports so the receiver can reach them. AnyIPv4 so
-    // the receiver's unicast packets arrive regardless of which local
-    // interface routes to it. (First real-device run: if the receiver
-    // never clock-syncs, check the Windows-Firewall inbound rule for
-    // the app, these are unsolicited inbound UDP datagrams.)
-    if (!timingSock_.bind(QHostAddress::AnyIPv4, 0)
-        || !controlSock_.bind(QHostAddress::AnyIPv4, 0)
-        || !audioSock_.bind(QHostAddress::AnyIPv4, 0)) {
+    // control/timing ports so the receiver can reach them. Ephemeral
+    // (port 0), bound to all interfaces, so the receiver's unicast packets
+    // arrive regardless of which local interface routes to it. (First
+    // real-device run: if the receiver never clock-syncs, check the
+    // firewall's inbound rule for this process, these are unsolicited
+    // inbound UDP datagrams.)
+    timingHandle_ = transport_.udpBind(0, [this](const uint8_t* d, size_t n,
+                                                 const std::string& h, uint16_t p) {
+        onTimingData_(d, n, h, p);
+    });
+    controlHandle_ = transport_.udpBind(0, [this](const uint8_t* d, size_t n,
+                                                  const std::string& h, uint16_t p) {
+        onControlData_(d, n, h, p);
+    });
+    audioHandle_ = transport_.udpBind(0, nullptr);   // send-only, no reads expected
+    if (timingHandle_ == kNoHandle || controlHandle_ == kNoHandle || audioHandle_ == kNoHandle) {
         Log::warn("Cast: RAOP UDP bind failed");
-        emit launched(false, tr("Could not bind UDP sockets"));
+        if (timingHandle_ != kNoHandle)  { transport_.close(timingHandle_);  timingHandle_ = kNoHandle; }
+        if (controlHandle_ != kNoHandle) { transport_.close(controlHandle_); controlHandle_ = kNoHandle; }
+        if (audioHandle_ != kNoHandle)   { transport_.close(audioHandle_);   audioHandle_ = kNoHandle; }
+        if (onLaunched) onLaunched(false, "Could not bind UDP sockets");
         return;
     }
 
     state_ = State::Connecting;
-    timeout_.start();
-    Log::info("Cast: RAOP connecting to {}:{} ('{}')",
-              host.toStdString(), port, name.toStdString());
-    rtsp_.connectToHost(host, port);
+    startHandshakeTimeout_();
+    Log::info("Cast: RAOP connecting to {}:{} ('{}')", host, port, name);
+    rtspHandle_ = transport_.tcpConnect(host, port,
+        [this, port] {
+            if (state_ != State::Connecting) return;
+            rtspConnected_ = true;
+            Log::info("Cast: RAOP RTSP connected to {}:{}", host_, port);
+            // v0.66.x Phase 2/3, run the auth/pairing chain first; for plain
+            // Phase-1 receivers it falls straight through to OPTIONS.
+            beginAuthChain_();
+        },
+        [this](const uint8_t* d, size_t n, const std::string&, uint16_t) { onRtspData_(d, n); },
+        [this](const std::string& reason) { onRtspClosed_(reason); });
+    if (rtspHandle_ == kNoHandle)
+        fail_("Could not start connecting to the device");
 }
 
 void RaopSender::stop() {
     if (state_ == State::Idle) return;
-    pacer_.stop();
-    syncTimer_.stop();
-    timeout_.stop();
-    pinTimeout_.stop();
-    feedbackTimer_.stop();
-    if (rtsp_.state() == QAbstractSocket::ConnectedState
-        && (!rtspSession_.isEmpty() || airplay2_)) {
+    stopTimer_(pacerTimerId_);
+    stopTimer_(syncTimerId_);
+    stopTimer_(handshakeTimeoutId_);
+    stopTimer_(pinTimeoutId_);
+    stopTimer_(feedbackTimerId_);
+    if (rtspConnected_ && (!rtspSession_.empty() || airplay2_)) {
         // v0.66.x, AP2 has no RTSP Session header (no RTSP SETUP), so send
         // a bare TEARDOWN; AP1 carries the Session it got from SETUP.
-        QList<QPair<QByteArray, QByteArray>> extra;
-        if (!rtspSession_.isEmpty())
-            extra.append({QByteArrayLiteral("Session"), rtspSession_});
-        sendRequest_(QByteArrayLiteral("TEARDOWN"), rtspUri_(), {}, {}, extra);
-        // Same lesson as CastChannel::stop(): make sure the TEARDOWN
-        // actually leaves this machine before the socket goes away,
-        // otherwise the receiver keeps the session open for minutes.
-        rtsp_.flush();
-        rtsp_.waitForBytesWritten(500);
+        std::vector<std::pair<std::string, std::string>> extra;
+        if (!rtspSession_.empty()) extra.push_back({"Session", rtspSession_});
+        sendRequest_("TEARDOWN", rtspUri_(), {}, {}, extra);
+        // No flush()/waitForBytesWritten() dance needed here (the original
+        // Qt version had one): ITransport::send(), called by sendRequest_
+        // above, already blocks until every byte is in the kernel's socket
+        // buffer, so the TEARDOWN has already left this machine.
     }
-    state_ = State::Idle;   // BEFORE disconnect → the handler stays quiet
-    rtsp_.disconnectFromHost();
-    if (rtsp_.state() != QAbstractSocket::UnconnectedState
-        && !rtsp_.waitForDisconnected(300))
-        rtsp_.abort();
-    audioSock_.close();
-    controlSock_.close();
-    timingSock_.close();
-    eventSock_.abort();   // #90, AP2 event channel
+    state_ = State::Idle;   // BEFORE closing → onRtspClosed_ stays quiet
+    if (rtspHandle_ != kNoHandle) { transport_.close(rtspHandle_); rtspHandle_ = kNoHandle; }
+    rtspConnected_ = false;
+    if (audioHandle_ != kNoHandle)   { transport_.close(audioHandle_);   audioHandle_ = kNoHandle; }
+    if (controlHandle_ != kNoHandle) { transport_.close(controlHandle_); controlHandle_ = kNoHandle; }
+    if (timingHandle_ != kNoHandle)  { transport_.close(timingHandle_);  timingHandle_ = kNoHandle; }
+    if (eventHandle_ != kNoHandle)   { transport_.close(eventHandle_);   eventHandle_ = kNoHandle; }   // #90, AP2 event channel
     // Free the backlog payloads (~1.4 MB when full).
-    for (auto& b : backlog_) b = QByteArray();
+    for (auto& b : backlog_) b.clear();
     backlogSeq_.assign(kBacklogSize, -1);
     Log::info("Cast: RAOP session stopped");
 }
 
-void RaopSender::fail_(const QString& why) {
-    Log::warn("Cast: RAOP error, {}", why.toStdString());
+void RaopSender::fail_(const std::string& why) {
+    Log::warn("Cast: RAOP error, {}", why);
     const bool wasStarting = state_ != State::Streaming;
     state_ = State::Idle;
-    pacer_.stop();
-    syncTimer_.stop();
-    timeout_.stop();
-    pinTimeout_.stop();
-    feedbackTimer_.stop();
-    rtsp_.abort();
-    audioSock_.close();
-    controlSock_.close();
-    timingSock_.close();
-    eventSock_.abort();   // #90, don't leak the AP2 event-channel auto-responder
-    if (wasStarting) emit launched(false, why);
-    emit closed();
+    stopTimer_(pacerTimerId_);
+    stopTimer_(syncTimerId_);
+    stopTimer_(handshakeTimeoutId_);
+    stopTimer_(pinTimeoutId_);
+    stopTimer_(feedbackTimerId_);
+    if (rtspHandle_ != kNoHandle) { transport_.close(rtspHandle_); rtspHandle_ = kNoHandle; }
+    rtspConnected_ = false;
+    if (audioHandle_ != kNoHandle)   { transport_.close(audioHandle_);   audioHandle_ = kNoHandle; }
+    if (controlHandle_ != kNoHandle) { transport_.close(controlHandle_); controlHandle_ = kNoHandle; }
+    if (timingHandle_ != kNoHandle)  { transport_.close(timingHandle_);  timingHandle_ = kNoHandle; }
+    if (eventHandle_ != kNoHandle)   { transport_.close(eventHandle_);   eventHandle_ = kNoHandle; }   // #90, don't leak the AP2 event-channel auto-responder
+    if (wasStarting && onLaunched) onLaunched(false, why);
+    if (onClosed) onClosed();
 }
 
 void RaopSender::setVolume(double pct) {
@@ -433,31 +564,27 @@ void RaopSender::setVolume(double pct) {
     const double dbfs = (pct < 0.01) ? -144.0 : (-30.0 + 0.3 * pct);
     pendingVolumeDb_ = dbfs;
     if (state_ == State::Streaming) {
-        const QByteArray body =
-            "volume: " + QByteArray::number(dbfs, 'f', 6);
-        QList<QPair<QByteArray, QByteArray>> vh;
-        if (!rtspSession_.isEmpty())
-            vh.append({QByteArrayLiteral("Session"), rtspSession_});
-        sendRequest_(QByteArrayLiteral("SET_PARAMETER"), rtspUri_(),
-                     QByteArrayLiteral("text/parameters"), body, vh);
+        const std::string body = "volume: " + fixed6(dbfs);
+        std::vector<std::pair<std::string, std::string>> vh;
+        if (!rtspSession_.empty()) vh.push_back({"Session", rtspSession_});
+        sendRequest_("SET_PARAMETER", rtspUri_(), "text/parameters", body, vh);
     }
 }
 
-void RaopSender::submitPin(const QString& code) {
+void RaopSender::submitPin(const std::string& code) {
     if (!waitingForPin_) return;
     waitingForPin_ = false;
-    pinTimeout_.stop();
-    timeout_.start();   // re-arm the handshake watchdog
+    stopTimer_(pinTimeoutId_);
+    startHandshakeTimeout_();   // re-arm the handshake watchdog
     Log::info("Cast: AirPlay PIN entered, continuing pairing");
     // HAP normal PIN, run SRP M3 with the user's code. (Legacy "Fruit"
     // PIN never reaches here: it fails fast in beginAuthChain_.)
     sendPairSetupM3_(code);
 }
 
-void RaopSender::setNowPlaying(const QString& title, const QString& artist,
-                               const QString& album,
-                               const QByteArray& cover,
-                               const QByteArray& coverMime) {
+void RaopSender::setNowPlaying(const std::string& title, const std::string& artist,
+                               const std::string& album, const std::string& cover,
+                               const std::string& coverMime) {
     const bool changed = (title != npTitle_) || (artist != npArtist_)
                          || (album != npAlbum_) || (cover != npCover_)
                          || (coverMime != npCoverMime_);
@@ -468,57 +595,38 @@ void RaopSender::setNowPlaying(const QString& title, const QString& artist,
     if (state_ == State::Streaming && changed) sendMetadata_();
 }
 
-namespace {
-// DMAP tag: 4-char ASCII code + 4-byte big-endian length + payload.
-QByteArray dmapTag(const char code[5], const QByteArray& payload) {
-    QByteArray t(code, 4);
-    t += char((payload.size() >> 24) & 0xFF);
-    t += char((payload.size() >> 16) & 0xFF);
-    t += char((payload.size() >> 8) & 0xFF);
-    t += char(payload.size() & 0xFF);
-    t += payload;
-    return t;
-}
-}  // namespace
-
 void RaopSender::sendMetadata_() {
     if (state_ != State::Streaming) return;
-    if (npTitle_.isEmpty() && npArtist_.isEmpty() && npAlbum_.isEmpty()
-        && npCover_.isEmpty())
+    if (npTitle_.empty() && npArtist_.empty() && npAlbum_.empty() && npCover_.empty())
         return;
     // RTP-Info ties the metadata to the audio timeline (pyatv form:
     // "seq=<rtpseq>;rtptime=<rtptime>"). Session present for AP1; for
     // AP2 it may be empty (the receiver tolerates its absence).
-    const QByteArray rtpInfo =
-        "seq=" + QByteArray::number(seq_) + ";rtptime="
-        + QByteArray::number(rtptime32_());
-    QList<QPair<QByteArray, QByteArray>> hdr;
-    if (!rtspSession_.isEmpty())
-        hdr.append({QByteArrayLiteral("Session"), rtspSession_});
-    hdr.append({QByteArrayLiteral("RTP-Info"), rtpInfo});
+    const std::string rtpInfo =
+        "seq=" + std::to_string(seq_) + ";rtptime=" + std::to_string(rtptime32_());
+    std::vector<std::pair<std::string, std::string>> hdr;
+    if (!rtspSession_.empty()) hdr.push_back({"Session", rtspSession_});
+    hdr.push_back({"RTP-Info", rtpInfo});
 
     // DMAP-tagged text metadata: mlit{ minm(title) asal(album) asar(artist) }
     // (pyatv tag order). Empty fields are omitted entirely.
-    QByteArray inner;
-    if (!npTitle_.isEmpty())  inner += dmapTag("minm", npTitle_.toUtf8());
-    if (!npAlbum_.isEmpty())  inner += dmapTag("asal", npAlbum_.toUtf8());
-    if (!npArtist_.isEmpty()) inner += dmapTag("asar", npArtist_.toUtf8());
-    if (!inner.isEmpty()) {
-        const QByteArray body = dmapTag("mlit", inner);
-        sendRequest_(QByteArrayLiteral("SET_PARAMETER"), rtspUri_(),
-                     QByteArrayLiteral("application/x-dmap-tagged"), body, hdr);
+    std::string inner;
+    if (!npTitle_.empty())  inner += dmapTag("minm", npTitle_);
+    if (!npAlbum_.empty())  inner += dmapTag("asal", npAlbum_);
+    if (!npArtist_.empty()) inner += dmapTag("asar", npArtist_);
+    if (!inner.empty()) {
+        const std::string body = dmapTag("mlit", inner);
+        sendRequest_("SET_PARAMETER", rtspUri_(), "application/x-dmap-tagged", body, hdr);
     }
 
     // Cover artwork as raw image bytes (pyatv: image/jpeg; PNG honoured).
     // Cap matches CastBridge's 8 MB cover read so nothing is silently
     // dropped between the two stages.
     bool coverSent = false;
-    if (!npCover_.isEmpty()) {
+    if (!npCover_.empty()) {
         if (npCover_.size() <= 8 * 1024 * 1024) {
-            const QByteArray mime = npCoverMime_.isEmpty()
-                ? QByteArrayLiteral("image/jpeg") : npCoverMime_;
-            sendRequest_(QByteArrayLiteral("SET_PARAMETER"), rtspUri_(),
-                         mime, npCover_, hdr);
+            const std::string mime = npCoverMime_.empty() ? "image/jpeg" : npCoverMime_;
+            sendRequest_("SET_PARAMETER", rtspUri_(), mime, npCover_, hdr);
             coverSent = true;
         } else {
             Log::info("Cast: RAOP cover not sent, {} bytes exceeds the 8 MB cap",
@@ -526,83 +634,80 @@ void RaopSender::sendMetadata_() {
         }
     }
     Log::info("Cast: RAOP now-playing pushed, '{}' / '{}'{}",
-              npTitle_.toStdString(), npArtist_.toStdString(),
-              coverSent ? " + cover" : "");
+              npTitle_, npArtist_, coverSent ? " + cover" : "");
 }
 
 // ── RTSP plumbing ────────────────────────────────────────────────
 
-QByteArray RaopSender::rtspUri_() const {
+std::string RaopSender::rtspUri_() const {
     // pyatv: rtsp://<our ip as the receiver sees it>/<session id>.
-    return "rtsp://" + rtsp_.localAddress().toString().toUtf8() + "/"
-         + QByteArray::number(sessionId_);
+    return "rtsp://" + transport_.localAddress(rtspHandle_) + "/" + std::to_string(sessionId_);
 }
 
-void RaopSender::sendRequest_(const QByteArray& method, const QByteArray& uri,
-                              const QByteArray& contentType,
-                              const QByteArray& body,
-                              const QList<QPair<QByteArray, QByteArray>>& extra) {
-    QByteArray req = method + " " + uri + " RTSP/1.0\r\n";
-    req += "CSeq: " + QByteArray::number(cseq_++) + "\r\n";
+void RaopSender::sendRequest_(const std::string& method, const std::string& uri,
+                              const std::string& contentType, const std::string& body,
+                              const std::vector<std::pair<std::string, std::string>>& extra) {
+    std::string req = method + " " + uri + " RTSP/1.0\r\n";
+    req += "CSeq: " + std::to_string(cseq_++) + "\r\n";
     req += "User-Agent: AirPlay/550.10\r\n";          // pyatv's UA string
     req += "DACP-ID: " + dacpId_ + "\r\n";
-    req += "Active-Remote: " + QByteArray::number(activeRemote_) + "\r\n";
+    req += "Active-Remote: " + std::to_string(activeRemote_) + "\r\n";
     req += "Client-Instance: " + dacpId_ + "\r\n";
     req += "X-Apple-Client-Name: FXChainPlayer\r\n";   // AirPlay-bug fix, owntone parity
     // v0.66.x, RTSP digest auth for pw=true receivers: once a 401 has
     // told us realm+nonce, every subsequent request carries Authorization.
-    if (!digestNonce_.isEmpty() && !digestPassword_.isEmpty()) {
+    if (!digestNonce_.empty() && !digestPassword_.empty()) {
         const std::string ah = airplay::digestAuthResponse(
-            method.toStdString(), uri.toStdString(), "iTunes",
-            digestRealm_.toStdString(), digestPassword_.toStdString(),
-            digestNonce_.toStdString());
-        req += "Authorization: " + QByteArray::fromStdString(ah) + "\r\n";
+            method, uri, "iTunes", digestRealm_, digestPassword_, digestNonce_);
+        req += "Authorization: " + ah + "\r\n";
     }
     for (const auto& h : extra)
         req += h.first + ": " + h.second + "\r\n";
-    if (!contentType.isEmpty())
+    if (!contentType.empty())
         req += "Content-Type: " + contentType + "\r\n";
-    if (!body.isEmpty())
-        req += "Content-Length: " + QByteArray::number(body.size()) + "\r\n";
+    if (!body.empty())
+        req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
     req += "\r\n";
     req += body;
-    pendingMethods_.append(method);
-    pendingIsHttp_.append(false);          // RTSP reply
+    pendingMethods_.push_back(method);
+    pendingIsHttp_.push_back(false);          // RTSP reply
     // Remember the last handshake request so a 401 can re-issue it with auth.
     pendingDigestMethod_ = method;
     pendingDigestUri_    = uri;
     writeRtsp_(req);
     if (state_ == State::Handshake || state_ == State::Pairing)
-        timeout_.start();   // fresh window per handshake step
+        startHandshakeTimeout_();   // fresh window per handshake step
 }
 
 // AP2 encrypted control channel (#90), frame the request bytes
 // [2-byte LE len][cipher][16-byte tag], chunked at 1024, Control-Write key +
 // 8-byte LE per-frame counter; plaintext before pair-verify completes.
-void RaopSender::writeRtsp_(const QByteArray& data) {
-    if (!controlEncrypted_ || !ap2_) { rtsp_.write(data); return; }
-    QByteArray out;
-    int off = 0;
-    const int n = data.size();
+void RaopSender::writeRtsp_(const std::string& data) {
+    if (!controlEncrypted_ || !ap2_) {
+        transport_.send(rtspHandle_, reinterpret_cast<const uint8_t*>(data.data()), data.size());
+        return;
+    }
+    std::string out;
+    size_t off = 0;
+    const size_t n = data.size();
     while (off < n) {
-        const int len = std::min(1024, n - off);
-        const unsigned char lp[2] = {
-            static_cast<unsigned char>(len & 0xFF),
-            static_cast<unsigned char>((len >> 8) & 0xFF) };
-        airplay::Bytes nonce8(8);
+        const size_t len = std::min<size_t>(1024, n - off);
+        const uint8_t lp[2] = {
+            static_cast<uint8_t>(len & 0xFF),
+            static_cast<uint8_t>((len >> 8) & 0xFF) };
+        Bytes nonce8(8);
         for (int i = 0; i < 8; ++i)
             nonce8[size_t(i)] = static_cast<uint8_t>((ctrlSendCtr_ >> (8 * i)) & 0xFF);
         ++ctrlSendCtr_;
-        const auto* p = reinterpret_cast<const uint8_t*>(data.constData() + off);
-        const airplay::Bytes pt(p, p + len);
-        const airplay::Bytes aad(lp, lp + 2);
-        const airplay::Bytes ct =
-            airplay::chacha20Poly1305Encrypt(ap2_->controlOut, nonce8, pt, aad);
+        const auto* p = reinterpret_cast<const uint8_t*>(data.data() + off);
+        const Bytes pt(p, p + len);
+        const Bytes aad(lp, lp + 2);
+        const Bytes ct = airplay::chacha20Poly1305Encrypt(ap2_->controlOut, nonce8, pt, aad);
         out.append(reinterpret_cast<const char*>(lp), 2);
-        out.append(reinterpret_cast<const char*>(ct.data()), static_cast<int>(ct.size()));
+        out.append(reinterpret_cast<const char*>(ct.data()), ct.size());
         off += len;
     }
-    rtsp_.write(out);
+    transport_.send(rtspHandle_, reinterpret_cast<const uint8_t*>(out.data()), out.size());
 }
 
 // #90/#109, AP2 event channel. The receiver pushes encrypted RTSP requests
@@ -612,170 +717,166 @@ void RaopSender::writeRtsp_(const QByteArray& data) {
 // [16-byte tag], AAD = the 2 length bytes, nonce = 4 zero + 8-byte LE counter),
 // keyed with the Events keys + independent per-direction counters (eventIn
 // decrypts, eventOut encrypts, swapped because it's a reverse connection).
-void RaopSender::onEventReadyRead_() {
-    if (state_ == State::Idle) { eventSock_.readAll(); return; }  // dead session, drain, don't auto-answer
-    if (!ap2_ || ap2_->eventIn.size() != 32 || ap2_->eventOut.size() != 32) {
-        eventSock_.readAll();   // not keyed yet, drain
-        return;
-    }
-    eventEncBuf_ += eventSock_.readAll();
+void RaopSender::onEventData_(const uint8_t* data, size_t len) {
+    if (state_ == State::Idle) return;   // dead session, don't auto-answer
+    if (!ap2_ || ap2_->eventIn.size() != 32 || ap2_->eventOut.size() != 32) return;   // not keyed yet
+    eventEncBuf_.append(reinterpret_cast<const char*>(data), len);
     while (eventEncBuf_.size() >= 2) {
-        const int len = static_cast<unsigned char>(eventEncBuf_[0])
+        const int frameLen = static_cast<unsigned char>(eventEncBuf_[0])
             | (static_cast<int>(static_cast<unsigned char>(eventEncBuf_[1])) << 8);
-        const int need = 2 + len + 16;
+        const size_t need = 2 + size_t(frameLen) + 16;
         if (eventEncBuf_.size() < need) break;   // frame still arriving
-        const unsigned char lp[2] = {
-            static_cast<unsigned char>(eventEncBuf_[0]),
-            static_cast<unsigned char>(eventEncBuf_[1]) };
-        airplay::Bytes nonce8(8);
+        const uint8_t lp[2] = {
+            static_cast<uint8_t>(eventEncBuf_[0]),
+            static_cast<uint8_t>(eventEncBuf_[1]) };
+        Bytes nonce8(8);
         for (int i = 0; i < 8; ++i)
             nonce8[size_t(i)] = static_cast<uint8_t>((eventRecvCtr_ >> (8 * i)) & 0xFF);
         ++eventRecvCtr_;
-        const auto* cipher =
-            reinterpret_cast<const uint8_t*>(eventEncBuf_.constData() + 2);
-        const airplay::Bytes ctTag(cipher, cipher + len + 16);
-        const airplay::Bytes aad(lp, lp + 2);
+        const auto* cipher = reinterpret_cast<const uint8_t*>(eventEncBuf_.data() + 2);
+        const Bytes ctTag(cipher, cipher + frameLen + 16);
+        const Bytes aad(lp, lp + 2);
         auto dec = airplay::chacha20Poly1305Decrypt(ap2_->eventIn, nonce8, ctTag, aad);
         if (!dec) {
             Log::warn("Cast: AirPlay 2 event-channel decrypt failed, dropping");
             eventEncBuf_.clear();
             return;
         }
-        eventPlainBuf_.append(reinterpret_cast<const char*>(dec->data()),
-                              static_cast<int>(dec->size()));
-        eventEncBuf_.remove(0, need);
+        eventPlainBuf_.append(reinterpret_cast<const char*>(dec->data()), dec->size());
+        eventEncBuf_.erase(0, need);
     }
     // Answer each complete RTSP request with an encrypted 200 OK.
     for (;;) {
-        const int headEnd = eventPlainBuf_.indexOf("\r\n\r\n");
-        if (headEnd < 0) break;
-        int contentLen = 0;
-        QByteArray cseq;
-        for (const QByteArray& line : eventPlainBuf_.left(headEnd).split('\n')) {
-            const QByteArray t = line.trimmed();
-            const int colon = t.indexOf(':');
-            if (colon <= 0) continue;
-            const QByteArray k = t.left(colon).toLower().trimmed();
-            const QByteArray v = t.mid(colon + 1).trimmed();
-            if (k == "content-length") contentLen = v.toInt();
+        const size_t headEnd = eventPlainBuf_.find("\r\n\r\n");
+        if (headEnd == std::string::npos) break;
+        size_t contentLen = 0;
+        std::string cseq;
+        for (const std::string& line : splitStr(eventPlainBuf_.substr(0, headEnd), '\n')) {
+            const std::string t = trimmed(line);
+            const size_t colon = t.find(':');
+            if (colon == std::string::npos || colon == 0) continue;
+            const std::string k = toLowerStr(trimmed(t.substr(0, colon)));
+            const std::string v = trimmed(t.substr(colon + 1));
+            if (k == "content-length") contentLen = size_t(toIntOr0(v));
             else if (k == "cseq")      cseq = v;
         }
-        const int total = headEnd + 4 + (contentLen > 0 ? contentLen : 0);
+        const size_t total = headEnd + 4 + contentLen;
         if (eventPlainBuf_.size() < total) break;   // body still arriving
-        eventPlainBuf_.remove(0, total);
+        eventPlainBuf_.erase(0, total);
         // Encrypted 200 OK, owntone's respond() sends a BARE 200 (just Server),
         // no Content-Length/Audio-Latency (those can corrupt the receiver's
         // realtime timeline). Echo CSeq when the request carried one.
-        QByteArray resp = "RTSP/1.0 200 OK\r\n";
+        std::string resp = "RTSP/1.0 200 OK\r\n";
         resp += "Server: AirTunes/550.10\r\n";
-        if (!cseq.isEmpty()) resp += "CSeq: " + cseq + "\r\n";
+        if (!cseq.empty()) resp += "CSeq: " + cseq + "\r\n";
         resp += "\r\n";
-        const int rlen = resp.size();
-        const unsigned char rlp[2] = {
-            static_cast<unsigned char>(rlen & 0xFF),
-            static_cast<unsigned char>((rlen >> 8) & 0xFF) };
-        airplay::Bytes wnonce(8);
+        const size_t rlen = resp.size();
+        const uint8_t rlp[2] = {
+            static_cast<uint8_t>(rlen & 0xFF),
+            static_cast<uint8_t>((rlen >> 8) & 0xFF) };
+        Bytes wnonce(8);
         for (int i = 0; i < 8; ++i)
             wnonce[size_t(i)] = static_cast<uint8_t>((eventSendCtr_ >> (8 * i)) & 0xFF);
         ++eventSendCtr_;
-        const airplay::Bytes rpt(
-            reinterpret_cast<const uint8_t*>(resp.constData()),
-            reinterpret_cast<const uint8_t*>(resp.constData()) + rlen);
-        const airplay::Bytes raad(rlp, rlp + 2);
-        const airplay::Bytes rct =
-            airplay::chacha20Poly1305Encrypt(ap2_->eventOut, wnonce, rpt, raad);
-        QByteArray out;
+        const Bytes rpt(reinterpret_cast<const uint8_t*>(resp.data()),
+                        reinterpret_cast<const uint8_t*>(resp.data()) + rlen);
+        const Bytes raad(rlp, rlp + 2);
+        const Bytes rct = airplay::chacha20Poly1305Encrypt(ap2_->eventOut, wnonce, rpt, raad);
+        std::string out;
         out.append(reinterpret_cast<const char*>(rlp), 2);
-        out.append(reinterpret_cast<const char*>(rct.data()),
-                   static_cast<int>(rct.size()));
-        eventSock_.write(out);
+        out.append(reinterpret_cast<const char*>(rct.data()), rct.size());
+        transport_.send(eventHandle_, reinterpret_cast<const uint8_t*>(out.data()), out.size());
     }
 }
 
-void RaopSender::onRtspReadyRead_() {
+void RaopSender::onEventClosed_(const std::string& reason) {
+    eventHandle_ = kNoHandle;
+    // Surface an event-channel drop instead of silently ignoring it
+    // (a receiver that drops the event channel usually tears down the session).
+    if (!reason.empty() && (state_ == State::Streaming || state_ == State::Handshake))
+        Log::warn("Cast: AirPlay 2 event channel error: {}", reason);
+}
+
+void RaopSender::onRtspData_(const uint8_t* data, size_t len) {
     if (!controlEncrypted_ || !ap2_) {
-        rxBuf_ += rtsp_.readAll();
+        rxBuf_.append(reinterpret_cast<const char*>(data), len);
     } else {
         // AP2 encrypted control channel (#90), decrypt whole frames
         // [2-byte LE len][cipher][16-byte tag] into the plaintext rxBuf_.
-        const QByteArray encChunk = rtsp_.readAll();
-        if (!encChunk.isEmpty())   // #150 diag, does the receiver reply at all?
-            Log::info("Cast: AirPlay 2 control rx +{} enc byte(s)", int(encChunk.size()));
-        rtspEncBuf_ += encChunk;
+        if (len > 0)   // #150 diag, does the receiver reply at all?
+            Log::info("Cast: AirPlay 2 control rx +{} enc byte(s)", len);
+        rtspEncBuf_.append(reinterpret_cast<const char*>(data), len);
         while (rtspEncBuf_.size() >= 2) {
-            const int len = static_cast<unsigned char>(rtspEncBuf_[0])
+            const int frameLen = static_cast<unsigned char>(rtspEncBuf_[0])
                 | (static_cast<int>(static_cast<unsigned char>(rtspEncBuf_[1])) << 8);
-            const int need = 2 + len + 16;
+            const size_t need = 2 + size_t(frameLen) + 16;
             if (rtspEncBuf_.size() < need) break;   // frame still arriving
-            const unsigned char lp[2] = {
-                static_cast<unsigned char>(rtspEncBuf_[0]),
-                static_cast<unsigned char>(rtspEncBuf_[1]) };
-            airplay::Bytes nonce8(8);
+            const uint8_t lp[2] = {
+                static_cast<uint8_t>(rtspEncBuf_[0]),
+                static_cast<uint8_t>(rtspEncBuf_[1]) };
+            Bytes nonce8(8);
             for (int i = 0; i < 8; ++i)
                 nonce8[size_t(i)] = static_cast<uint8_t>((ctrlRecvCtr_ >> (8 * i)) & 0xFF);
             ++ctrlRecvCtr_;
-            const auto* cipher =
-                reinterpret_cast<const uint8_t*>(rtspEncBuf_.constData() + 2);
-            const airplay::Bytes ctTag(cipher, cipher + len + 16);
-            const airplay::Bytes aad(lp, lp + 2);
+            const auto* cipher = reinterpret_cast<const uint8_t*>(rtspEncBuf_.data() + 2);
+            const Bytes ctTag(cipher, cipher + frameLen + 16);
+            const Bytes aad(lp, lp + 2);
             auto dec = airplay::chacha20Poly1305Decrypt(ap2_->controlIn, nonce8, ctTag, aad);
             if (!dec) {
-                fail_(tr("Encrypted control channel authentication failed"));
+                fail_("Encrypted control channel authentication failed");
                 return;
             }
-            rxBuf_.append(reinterpret_cast<const char*>(dec->data()),
-                          static_cast<int>(dec->size()));
-            rtspEncBuf_.remove(0, need);
+            rxBuf_.append(reinterpret_cast<const char*>(dec->data()), dec->size());
+            rtspEncBuf_.erase(0, need);
         }
     }
     // Audit fix, a hostile/buggy receiver that dribbles a never-terminating
     // head (or a huge Content-Length) could grow rxBuf_ unbounded. RTSP control
     // responses are tiny; cap the buffer and drop the session if exceeded.
     if (rxBuf_.size() > 4 * 1024 * 1024) {
-        fail_(tr("Oversized RTSP response from the receiver"));
+        fail_("Oversized RTSP response from the receiver");
         return;
     }
     for (;;) {
-        const int headEnd = rxBuf_.indexOf("\r\n\r\n");
-        if (headEnd < 0) return;
+        const size_t headEnd = rxBuf_.find("\r\n\r\n");
+        if (headEnd == std::string::npos) return;
         // Parse the head: status line + headers (lower-cased keys).
-        const QByteArray head = rxBuf_.left(headEnd);
-        const QList<QByteArray> lines = head.split('\n');
-        QHash<QByteArray, QByteArray> headers;
-        for (int i = 1; i < lines.size(); ++i) {
-            const QByteArray line = lines[i].trimmed();
-            const int colon = line.indexOf(':');
-            if (colon <= 0) continue;
-            headers.insert(line.left(colon).toLower().trimmed(),
-                           line.mid(colon + 1).trimmed());
+        const std::string head = rxBuf_.substr(0, headEnd);
+        const std::vector<std::string> lines = splitStr(head, '\n');
+        std::map<std::string, std::string> headers;
+        for (size_t i = 1; i < lines.size(); ++i) {
+            const std::string line = trimmed(lines[i]);
+            const size_t colon = line.find(':');
+            if (colon == std::string::npos || colon == 0) continue;
+            headers[toLowerStr(trimmed(line.substr(0, colon)))] = trimmed(line.substr(colon + 1));
         }
         bool clOk = false;
-        int contentLen = headers.value("content-length", "0").toInt(&clOk);
+        long contentLen = toIntChecked(headerValue(headers, "content-length", "0"), &clOk);
         if (!clOk || contentLen < 0) contentLen = 0;   // audit fix, reject bad/negative length
-        if (rxBuf_.size() < headEnd + 4 + contentLen) return;   // body pending
-        const QByteArray statusLine = lines.value(0).trimmed();
+        if (rxBuf_.size() < headEnd + 4 + size_t(contentLen)) return;   // body pending
+        const std::string statusLine = trimmed(atOr(lines, 0));
         // v0.66.x, pairing + AP2 plists need the body, so capture it now.
-        const QByteArray body = rxBuf_.mid(headEnd + 4, contentLen);
-        rxBuf_.remove(0, headEnd + 4 + contentLen);
+        const std::string body = rxBuf_.substr(headEnd + 4, size_t(contentLen));
+        rxBuf_.erase(0, headEnd + 4 + size_t(contentLen));
 
-        const bool isRtsp = statusLine.startsWith("RTSP/");
-        const bool isHttp = statusLine.startsWith("HTTP/");
+        const bool isRtsp = statusLine.starts_with("RTSP/");
+        const bool isHttp = statusLine.starts_with("HTTP/");
         if (!isRtsp && !isHttp) {
             // A server→client RTSP request (rare; some receivers push
             // events). We don't act on any, consume + log.
-            Log::info("Cast: RAOP ignoring server request '{}'",
-                      statusLine.toStdString());
+            Log::info("Cast: RAOP ignoring server request '{}'", statusLine);
             continue;
         }
-        const QList<QByteArray> parts = statusLine.split(' ');
-        const int code = parts.value(1).toInt();
-        if (pendingMethods_.isEmpty()) {
+        const std::vector<std::string> parts = splitStr(statusLine, ' ');
+        const int code = toIntOr0(atOr(parts, 1));
+        if (pendingMethods_.empty()) {
             Log::warn("Cast: RAOP unexpected response (code {})", code);
             continue;
         }
-        const QByteArray method = pendingMethods_.takeFirst();
-        const bool replyIsHttp = pendingIsHttp_.isEmpty()
-                                     ? false : pendingIsHttp_.takeFirst();
+        const std::string method = pendingMethods_.front();
+        pendingMethods_.erase(pendingMethods_.begin());
+        const bool replyIsHttp = pendingIsHttp_.empty() ? false : pendingIsHttp_.front();
+        if (!pendingIsHttp_.empty()) pendingIsHttp_.erase(pendingIsHttp_.begin());
 
         // v0.66.x Phase 2/3, route HTTP-mode replies (pairing / AP2
         // plists) to the pairing dispatcher; everything else is RTSP.
@@ -788,8 +889,27 @@ void RaopSender::onRtspReadyRead_() {
     }
 }
 
-void RaopSender::handleResponse_(const QByteArray& method, int code,
-                                 const QHash<QByteArray, QByteArray>& headers) {
+void RaopSender::onRtspClosed_(const std::string& reason) {
+    rtspConnected_ = false;
+    rtspHandle_ = kNoHandle;   // the transport already tore it down
+    if (state_ == State::Idle) return;   // our own stop(), quiet
+    if (!reason.empty()) {
+        fail_(reason);
+        return;
+    }
+    // Graceful close from the far end.
+    const bool wasStarting = state_ != State::Streaming;
+    state_ = State::Idle;
+    stopTimer_(pacerTimerId_);
+    stopTimer_(syncTimerId_);
+    stopTimer_(handshakeTimeoutId_);
+    stopTimer_(pinTimeoutId_);
+    stopTimer_(feedbackTimerId_);
+    if (wasStarting && onLaunched) onLaunched(false, "Connection closed by the device");
+    if (onClosed) onClosed();
+}
+
+void RaopSender::handleResponse_(const std::string& method, int code, const Headers& headers) {
     // Streaming-time auxiliaries first, failures are non-fatal there.
     if (method == "SET_PARAMETER") {
         if (code != 200)
@@ -798,9 +918,10 @@ void RaopSender::handleResponse_(const QByteArray& method, int code,
     }
     if (method == "POST") {   // /feedback keep-alive probe (AP1)
         if (code == 200) {
-            if (!feedbackTimer_.isActive()) feedbackTimer_.start();
+            if (feedbackTimerId_ == -1)
+                startRepeating_(feedbackTimerId_, kFeedbackIntervalMs, [this] { onFeedbackTick_(); });
         } else {
-            feedbackTimer_.stop();
+            stopTimer_(feedbackTimerId_);
             Log::info("Cast: RAOP /feedback not supported ({}), "
                       "keep-alive disabled", code);
         }
@@ -811,41 +932,40 @@ void RaopSender::handleResponse_(const QByteArray& method, int code,
 
     // v0.66.x, RTSP digest auth for pw=true receivers (RFC 2617 MD5).
     if (code == 401) {
-        if (digestPassword_.isEmpty()) {
-            fail_(tr("The device requires a password"));
+        if (digestPassword_.empty()) {
+            fail_("The device requires a password");
             return;
         }
         if (digestRetried_) {
-            fail_(tr("The password was not accepted by the device"));
+            fail_("The password was not accepted by the device");
             return;
         }
         // WWW-Authenticate: Digest realm="AirPlay", nonce="…"
-        const QByteArray wa = headers.value("www-authenticate");
-        auto extractQuoted = [&](const char* key) -> QByteArray {
-            const int k = wa.indexOf(key);
-            if (k < 0) return {};
-            const int q1 = wa.indexOf('"', k);
-            if (q1 < 0) return {};
-            const int q2 = wa.indexOf('"', q1 + 1);
-            if (q2 < 0) return {};
-            return wa.mid(q1 + 1, q2 - q1 - 1);
+        const std::string wa = headerValue(headers, "www-authenticate");
+        auto extractQuoted = [&](const char* key) -> std::string {
+            const size_t k = wa.find(key);
+            if (k == std::string::npos) return {};
+            const size_t q1 = wa.find('"', k);
+            if (q1 == std::string::npos) return {};
+            const size_t q2 = wa.find('"', q1 + 1);
+            if (q2 == std::string::npos) return {};
+            return wa.substr(q1 + 1, q2 - q1 - 1);
         };
         digestRealm_ = extractQuoted("realm=");
         digestNonce_ = extractQuoted("nonce=");
-        if (digestNonce_.isEmpty()) {
-            fail_(tr("The device password challenge could not be parsed"));
+        if (digestNonce_.empty()) {
+            fail_("The device password challenge could not be parsed");
             return;
         }
         digestRetried_ = true;
-        Log::info("Cast: RAOP digest challenge, re-sending '{}' with auth",
-                  method.toStdString());
+        Log::info("Cast: RAOP digest challenge, re-sending '{}' with auth", method);
         // Re-issue the request that was rejected. sendRequest_ now attaches
         // the Authorization header (digestNonce_ is set).
         if (method == "OPTIONS")       sendOptions_();
         else if (method == "ANNOUNCE") sendAnnounce_();
         else if (method == "SETUP")    sendSetup_();
         else if (method == "RECORD")   sendRecord_();
-        else fail_(tr("The device password was required at an unexpected step"));
+        else fail_("The device password was required at an unexpected step");
         return;
     }
     if (code < 200 || code >= 300) {
@@ -855,12 +975,10 @@ void RaopSender::handleResponse_(const QByteArray& method, int code,
         // packets drive playback. Only a handshake-phase (pre-Streaming)
         // failure aborts the session.
         if (state_ == State::Streaming && (method == "RECORD" || method == "FLUSH")) {
-            Log::info("Cast: RAOP {} not accepted ({}), non-fatal (AP2 realtime)",
-                      method.toStdString(), code);
+            Log::info("Cast: RAOP {} not accepted ({}), non-fatal (AP2 realtime)", method, code);
             return;
         }
-        fail_(tr("Device refused %1 (%2)")
-                  .arg(QString::fromLatin1(method)).arg(code));
+        fail_(Log::format("Device refused {} ({})", method, code));
         return;
     }
 
@@ -871,21 +989,21 @@ void RaopSender::handleResponse_(const QByteArray& method, int code,
     } else if (method == "SETUP") {
         // Transport: RTP/AVP/UDP;unicast;mode=record;server_port=N;
         //            control_port=N;timing_port=N
-        const QByteArray transport = headers.value("transport");
+        const std::string transport = headerValue(headers, "transport");
         serverPort_ = controlPort_ = timingPort_ = 0;
-        for (const QByteArray& opt : transport.split(';')) {
-            const int eq = opt.indexOf('=');
-            if (eq <= 0) continue;
-            const QByteArray key = opt.left(eq).trimmed();
-            const quint16 val = quint16(opt.mid(eq + 1).trimmed().toUInt());
+        for (const std::string& opt : splitStr(transport, ';')) {
+            const size_t eq = opt.find('=');
+            if (eq == std::string::npos || eq == 0) continue;
+            const std::string key = trimmed(opt.substr(0, eq));
+            const uint16_t val = uint16_t(toUIntOr0(trimmed(opt.substr(eq + 1))));
             if      (key == "server_port")  serverPort_  = val;
             else if (key == "control_port") controlPort_ = val;
             else if (key == "timing_port")  timingPort_  = val;
         }
-        rtspSession_ = headers.value("session");
-        if (rtspSession_.isEmpty()) rtspSession_ = QByteArrayLiteral("1");
+        rtspSession_ = headerValue(headers, "session");
+        if (rtspSession_.empty()) rtspSession_ = "1";
         if (serverPort_ == 0) {
-            fail_(tr("SETUP reply carried no server_port"));
+            fail_("SETUP reply carried no server_port");
             return;
         }
         Log::info("Cast: RAOP remote ports, server={} control={} timing={}",
@@ -894,10 +1012,9 @@ void RaopSender::handleResponse_(const QByteArray& method, int code,
     } else if (method == "RECORD") {
         // The receiver may report its buffer depth; informational only,
         // like pyatv we keep the fixed 22050+44100-frame latency model.
-        const QByteArray lat = headers.value("audio-latency");
-        if (!lat.isEmpty())
-            Log::info("Cast: RAOP receiver Audio-Latency={} frames",
-                      lat.toStdString());
+        const std::string lat = headerValue(headers, "audio-latency");
+        if (!lat.empty())
+            Log::info("Cast: RAOP receiver Audio-Latency={} frames", lat);
         // AP1: RECORD's reply is the trigger to begin streaming. AP2: RECORD
         // is sent fire-and-forget from WITHIN startStreaming_ (already
         // Streaming), so a late reply must NOT re-init the stream.
@@ -914,66 +1031,61 @@ void RaopSender::sendOptions_() {
     // Traditional session opener (iTunes sends it; every receiver
     // answers). pyatv skips it, but it doubles as a cheap liveness
     // probe before we commit the ANNOUNCE.
-    sendRequest_(QByteArrayLiteral("OPTIONS"), QByteArrayLiteral("*"),
-                 {}, {});
+    sendRequest_("OPTIONS", "*", {}, {});
 }
 
 void RaopSender::sendAnnounce_() {
     // pyatv ANNOUNCE_PAYLOAD: raw PCM (L16) with the classic fmtp
     // parameter list (352 frames/packet, 16-bit, 2 ch, 44100 Hz).
-    const QByteArray localIp  = rtsp_.localAddress().toString().toUtf8();
-    const QByteArray remoteIp = rtsp_.peerAddress().toString().toUtf8();
-    QByteArray sdp;
+    const std::string localIp  = transport_.localAddress(rtspHandle_);
+    const std::string remoteIp = transport_.peerAddress(rtspHandle_);
+    std::string sdp;
     sdp += "v=0\r\n";
-    sdp += "o=iTunes " + QByteArray::number(sessionId_) + " 0 IN IP4 "
-         + localIp + "\r\n";
+    sdp += "o=iTunes " + std::to_string(sessionId_) + " 0 IN IP4 " + localIp + "\r\n";
     sdp += "s=iTunes\r\n";
     sdp += "c=IN IP4 " + remoteIp + "\r\n";
     sdp += "t=0 0\r\n";
     sdp += "m=audio 0 RTP/AVP 96\r\n";
     sdp += "a=rtpmap:96 L16/44100/2\r\n";
     sdp += "a=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100\r\n";
-    sendRequest_(QByteArrayLiteral("ANNOUNCE"), rtspUri_(),
-                 QByteArrayLiteral("application/sdp"), sdp);
+    sendRequest_("ANNOUNCE", rtspUri_(), "application/sdp", sdp);
 }
 
 void RaopSender::sendSetup_() {
-    const QByteArray transport =
+    const std::string transport =
         "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port="
-        + QByteArray::number(controlSock_.localPort()) + ";timing_port="
-        + QByteArray::number(timingSock_.localPort());
-    sendRequest_(QByteArrayLiteral("SETUP"), rtspUri_(), {}, {},
-                 {{QByteArrayLiteral("Transport"), transport}});
+        + std::to_string(transport_.localPort(controlHandle_)) + ";timing_port="
+        + std::to_string(transport_.localPort(timingHandle_));
+    sendRequest_("SETUP", rtspUri_(), {}, {}, {{"Transport", transport}});
 }
 
 void RaopSender::sendRecord_() {
     // Classic single-RECORD form (see the deviation note up top):
     // RTP-Info announces the seq + rtptime of the FIRST audio packet.
-    const QByteArray rtpInfo = "seq=" + QByteArray::number(seq_)
-        + ";rtptime=" + QByteArray::number(rtptime32_());
-    QList<QPair<QByteArray, QByteArray>> hdr = {
-        {QByteArrayLiteral("Range"),    QByteArrayLiteral("npt=0-")},
-        {QByteArrayLiteral("RTP-Info"), rtpInfo}};
+    const std::string rtpInfo = "seq=" + std::to_string(seq_)
+        + ";rtptime=" + std::to_string(rtptime32_());
+    std::vector<std::pair<std::string, std::string>> hdr = {
+        {"Range", "npt=0-"}, {"RTP-Info", rtpInfo}};
     // AP1 carries the RTSP Session id; AP2 has no RTSP Session header (it keys
     // off the rtsp://host/sessionId URI), so only send it when we actually got
     // one from a Transport-mode SETUP.
-    if (!rtspSession_.isEmpty())
-        hdr.append({QByteArrayLiteral("Session"), rtspSession_});
-    sendRequest_(QByteArrayLiteral("RECORD"), rtspUri_(), {}, {}, hdr);
+    if (!rtspSession_.empty())
+        hdr.push_back({"Session", rtspSession_});
+    sendRequest_("RECORD", rtspUri_(), {}, {}, hdr);
 }
 
 void RaopSender::startStreaming_() {
     state_ = State::Streaming;
-    timeout_.stop();
+    stopTimer_(handshakeTimeoutId_);
     // pyatv StreamContext.reset(): anchor the timeline on wall-clock
     // NTP so sync-packet NTP values and our timing-server replies share
     // one epoch (the receiver correlates the two for clock recovery).
     startTs_ = ntp2ts(ntpNow_(), kRaopRate);
     framesSent_ = 0;
     firstAudio_ = true;
-    clock_.start();
+    clockStart_ = std::chrono::steady_clock::now();
     sendSyncPacket_(true);   // first sync carries the marker bit
-    syncTimer_.start();
+    startRepeating_(syncTimerId_, 1000, [this] { sendSyncPacket_(false); });
     // #90, RECORD already ran between session + stream SETUP (owntone order),
     // so streaming just needs sync + volume + the RTP loop here.
     // Volume requested before the session was up? Apply it now. pyatv
@@ -987,75 +1099,66 @@ void RaopSender::startStreaming_() {
     if (airplay2_ && pendingVolumeDb_ <= kNoVolume + 1.0)
         pendingVolumeDb_ = 0.0;
     if (pendingVolumeDb_ > kNoVolume + 1.0) {
-        const QByteArray body =
-            "volume: " + QByteArray::number(pendingVolumeDb_, 'f', 6);
-        QList<QPair<QByteArray, QByteArray>> vh;
-        if (!rtspSession_.isEmpty())
-            vh.append({QByteArrayLiteral("Session"), rtspSession_});
-        sendRequest_(QByteArrayLiteral("SET_PARAMETER"), rtspUri_(),
-                     QByteArrayLiteral("text/parameters"), body, vh);
+        const std::string body = "volume: " + fixed6(pendingVolumeDb_);
+        std::vector<std::pair<std::string, std::string>> vh;
+        if (!rtspSession_.empty()) vh.push_back({"Session", rtspSession_});
+        sendRequest_("SET_PARAMETER", rtspUri_(), "text/parameters", body, vh);
     }
-    pacer_.start();   // audio RTP loop starts LAST (after RECORD/FLUSH/volume)
+    startRepeating_(pacerTimerId_, kPacerMs, [this] { onPacerTick_(); });   // audio RTP loop starts LAST
     if (airplay2_) {
         // AP2: feedback is an HTTP POST /feedback every 2 s (pyatv
         // FEEDBACK_INTERVAL).
-        feedbackTimer_.setInterval(2000);
-        feedbackTimer_.start();
+        startRepeating_(feedbackTimerId_, 2000, [this] { onFeedbackTick_(); });
     } else {
         // Keep-alive probe (pyatv start_feedback): one POST /feedback; a
         // 200 arms the 25 s timer, anything else disables it for good.
-        sendRequest_(QByteArrayLiteral("POST"), QByteArrayLiteral("/feedback"),
-                     {}, {});
+        sendRequest_("POST", "/feedback", {}, {});
     }
     // Push the current track's metadata + cover to the receiver now that
     // the stream is live (track changes during playback re-push via
     // setNowPlaying → sendMetadata_).
     sendMetadata_();
     Log::info("Cast: RAOP streaming to '{}', RTP {} frames/packet @ {} Hz{}",
-              name_.toStdString(), kFramesPerPacket, kRaopRate,
+              name_, kFramesPerPacket, kRaopRate,
               (ap2_ && ap2_->encryptAudio) ? " (encrypted)" : "");
-    emit launched(true, {});
+    if (onLaunched) onLaunched(true, {});
 }
 
 // ── v0.66.x Phase 2/3, auth + pairing + AirPlay 2 ────────────────────
 
-void RaopSender::httpPost_(const QByteArray& uri, const QByteArray& contentType,
-                           const QByteArray& body) {
+void RaopSender::httpPost_(const std::string& uri, const std::string& contentType,
+                           const std::string& body) {
     // POST over the SAME TCP socket as RTSP. Real receivers parse both an
     // RTSP and an HTTP request line on this connection (pyatv uses one
     // multiplexed HttpConnection); we send a proper HTTP/1.1 request and
     // route the reply back to onPairingResponse_ via pendingIsHttp_.
-    QByteArray req = "POST " + uri + " HTTP/1.1\r\n";
-    req += "CSeq: " + QByteArray::number(cseq_++) + "\r\n";
+    std::string req = "POST " + uri + " HTTP/1.1\r\n";
+    req += "CSeq: " + std::to_string(cseq_++) + "\r\n";
     req += "User-Agent: AirPlay/550.10\r\n";
     req += "Connection: keep-alive\r\n";
-    req += "X-Apple-HKP: " +
-           QByteArray::number(authMethod_ == RaopDeviceInfo::Auth::HapTransient
-                                  ? 4 : 3) + "\r\n";
+    req += "X-Apple-HKP: " + std::to_string(authMethod_ == Auth::HapTransient ? 4 : 3) + "\r\n";
     req += "DACP-ID: " + dacpId_ + "\r\n";
-    req += "Active-Remote: " + QByteArray::number(activeRemote_) + "\r\n";
+    req += "Active-Remote: " + std::to_string(activeRemote_) + "\r\n";
     // owntone stamps Client-Instance + X-Apple-Client-Name on EVERY pairing
-    // request (request_headers_add). Our
-    // pairing builder omitted both, a macOS/Apple-TV receiver's access-control
-    // gate inspects the sender identity headers before the TLV, and their
-    // absence is a documented 403 cause. Mirror owntone (Client-Instance ==
-    // DACP-ID value).
+    // request (request_headers_add). Our pairing builder omitted both, a
+    // macOS/Apple-TV receiver's access-control gate inspects the sender
+    // identity headers before the TLV, and their absence is a documented
+    // 403 cause. Mirror owntone (Client-Instance == DACP-ID value).
     req += "Client-Instance: " + dacpId_ + "\r\n";
     req += "X-Apple-Client-Name: FXChainPlayer\r\n";
-    if (!contentType.isEmpty())
+    if (!contentType.empty())
         req += "Content-Type: " + contentType + "\r\n";
-    req += "Content-Length: " + QByteArray::number(body.size()) + "\r\n";
+    req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
     req += "\r\n";
     req += body;
-    pendingMethods_.append(QByteArrayLiteral("POST"));
-    pendingIsHttp_.append(true);
+    pendingMethods_.push_back("POST");
+    pendingIsHttp_.push_back(true);
     writeRtsp_(req);
-    if (!waitingForPin_) timeout_.start();
+    if (!waitingForPin_) startHandshakeTimeout_();
 }
 
 void RaopSender::beginAuthChain_() {
     state_ = State::Pairing;
-    using Auth = RaopDeviceInfo::Auth;
     switch (authMethod_) {
     case Auth::None:
         // Plain Phase-1 receiver, go straight to the RTSP handshake.
@@ -1078,10 +1181,9 @@ void RaopSender::beginAuthChain_() {
         // doomed unencrypted handshake the device will reject, fail with a
         // clear, actionable message. (The full legacy SRP-2048 flow needs a
         // real legacy device to verify; not implemented yet.)
-        fail_(tr("%1 uses an older AirPlay pairing that isn't supported yet. "
-                 "Update the device's software, or use an AirPlay-2 receiver "
-                 "(HomePod, Apple TV 4K, or a modern AirPlay speaker).")
-                  .arg(name_));
+        fail_(Log::format("{} uses an older AirPlay pairing that isn't supported yet. "
+                          "Update the device's software, or use an AirPlay-2 receiver "
+                          "(HomePod, Apple TV 4K, or a modern AirPlay speaker).", name_));
         return;
     case Auth::HapTransient:
         // HomePod / AP2, fixed-PIN 3939 transient pairing, no UI.
@@ -1091,18 +1193,16 @@ void RaopSender::beginAuthChain_() {
     case Auth::HapPin:
         // Apple TV 4+, stored creds → pair-verify; else on-screen PIN.
         ap2_ = std::make_unique<RaopAp2State>();
-        if (!credsJson_.isEmpty()) {
+        if (!credsJson_.empty()) {
             // Load stored long-term identity + the accessory's ltpk/id.
-            const QJsonObject o =
-                QJsonDocument::fromJson(credsJson_.toUtf8()).object();
-            ap2_->ltSeed = toBytes(QByteArray::fromHex(
-                o.value("ltsk").toString().toLatin1()));
-            ap2_->pairingId = toBytes(
-                o.value("clientId").toString().toUtf8());
-            ap2_->accessoryId = toBytes(QByteArray::fromHex(
-                o.value("atvId").toString().toLatin1()));
-            ap2_->accessoryLtpk = toBytes(QByteArray::fromHex(
-                o.value("ltpk").toString().toLatin1()));
+            const auto ltsk     = jsonStringValue(credsJson_, "ltsk");
+            const auto ltpk     = jsonStringValue(credsJson_, "ltpk");
+            const auto atvId    = jsonStringValue(credsJson_, "atvId");
+            const auto clientId = jsonStringValue(credsJson_, "clientId");
+            if (ltsk)     ap2_->ltSeed       = fromHexLenient(*ltsk);
+            if (clientId) ap2_->pairingId    = toBytes(*clientId);
+            if (atvId)    ap2_->accessoryId  = fromHexLenient(*atvId);
+            if (ltpk)     ap2_->accessoryLtpk = fromHexLenient(*ltpk);
             if (ap2_->ltSeed.size() == 32 && !ap2_->accessoryLtpk.empty()) {
                 ap2_->ltPub = airplay::ed25519PublicFromSeed(ap2_->ltSeed);
                 sendPairVerifyM1_();
@@ -1114,24 +1214,20 @@ void RaopSender::beginAuthChain_() {
     }
 }
 
-void RaopSender::onPairingResponse_(int code,
-                                    const QHash<QByteArray, QByteArray>& headers,
-                                    const QByteArray& body) {
-    Q_UNUSED(headers);
+void RaopSender::onPairingResponse_(int code, const Headers& headers, const std::string& body) {
+    (void)headers;
     if (state_ == State::Idle) return;
 
     // Once we're streaming the handshake is done; a late/duplicate
     // pairing-stage reply (e.g. a misbehaving receiver) must NOT be re-parsed
     // as a SETUP plist and tear down the live stream. Ignore it.
     if (state_ == State::Streaming) {
-        Log::info("Cast: RAOP ignoring a late pairing reply ({}) while streaming",
-                  code);
+        Log::info("Cast: RAOP ignoring a late pairing reply ({}) while streaming", code);
         return;
     }
 
     // auth-setup: response is ignored (pyatv does exactly this).
-    if (authMethod_ == RaopDeviceInfo::Auth::AuthSetup &&
-        ap2_ == nullptr && pairStage_ == PairStage::AuthSetup) {
+    if (authMethod_ == Auth::AuthSetup && ap2_ == nullptr && pairStage_ == PairStage::AuthSetup) {
         pairStage_ = PairStage::Done;
         afterAuthOk_();
         return;
@@ -1158,11 +1254,11 @@ void RaopSender::onPairingResponse_(int code,
         // (owntone returns AIRPLAY_SEQ_PIN_START on 470; pyatv posts
         // /pair-pin-start before M1.) One-shot, gated on the transient M1
         // stage so it can't loop.
-        if (code == 470 && authMethod_ == RaopDeviceInfo::Auth::HapTransient
+        if (code == 470 && authMethod_ == Auth::HapTransient
             && pairStage_ == PairStage::SetupM2) {
             Log::info("Cast: '{}' refused transient pairing (470), falling "
-                      "back to on-screen PIN pairing", name_.toStdString());
-            authMethod_ = RaopDeviceInfo::Auth::HapPin;
+                      "back to on-screen PIN pairing", name_);
+            authMethod_ = Auth::HapPin;
             ap2_ = std::make_unique<RaopAp2State>();   // fresh pairing state
             // v0.66.x, /pair-pin-start (HKP 3) FIRST so the Apple TV shows
             // its code, THEN M1. Sending M1 alone returns salt+B but never
@@ -1176,13 +1272,11 @@ void RaopSender::onPairingResponse_(int code,
         // Network" the Mac still accepts PIN-LESS TRANSIENT pairing, so try
         // that once before giving up. (One-shot, so a genuine "Current User"
         // Mac, which 403s transient too, falls through to the message.)
-        if (code == 403 && pairStage_ == PairStage::PinStart
-            && !triedTransientAfterPin403_) {
+        if (code == 403 && pairStage_ == PairStage::PinStart && !triedTransientAfterPin403_) {
             Log::info("Cast: '{}' refused /pair-pin-start (403), no on-screen "
-                      "PIN (Mac-style); trying transient pairing",
-                      name_.toStdString());
+                      "PIN (Mac-style); trying transient pairing", name_);
             triedTransientAfterPin403_ = true;
-            authMethod_ = RaopDeviceInfo::Auth::HapTransient;
+            authMethod_ = Auth::HapTransient;
             ap2_ = std::make_unique<RaopAp2State>();
             sendPairSetupM1_();
             return;
@@ -1198,18 +1292,18 @@ void RaopSender::onPairingResponse_(int code,
             // only accept Apple devices regardless of this setting, an Apple TV
             // or HomePod is the reliable target. On an Apple TV: Settings →
             // AirPlay & HomeKit → Allow Access → "Anyone on the Same Network".
-            fail_(tr("%1 refused pairing. On a Mac, set System Settings → "
+            fail_(Log::format("{} refused pairing. On a Mac, set System Settings → "
                      "AirDrop & Handoff → AirPlay Receiver → \"Allow AirPlay "
                      "for: Everyone\" and turn off Require Password, though a "
                      "Mac may only accept Apple devices. An Apple TV or HomePod "
                      "(Allow Access → \"Anyone on the Same Network\") is the "
-                     "reliable target.").arg(name_));
+                     "reliable target.", name_));
         } else if (code == 470) {
-            fail_(tr("%1 needs to be paired with a PIN, but it didn't show "
+            fail_(Log::format("{} needs to be paired with a PIN, but it didn't show "
                      "one. On the Apple TV / Mac set AirPlay access to "
-                     "\"Anyone on the Same Network\" and try again.").arg(name_));
+                     "\"Anyone on the Same Network\" and try again.", name_));
         } else {
-            fail_(tr("Pairing with %1 failed (HTTP %2)").arg(name_).arg(code));
+            fail_(Log::format("Pairing with {} failed (HTTP {})", name_, code));
         }
         return;
     }
@@ -1221,8 +1315,7 @@ void RaopSender::onPairingResponse_(int code,
     case PairStage::PinStart:
         // /pair-pin-start acknowledged, the device's 4-digit code is now on
         // screen. Begin the SRP handshake (M1, no transient flag).
-        Log::info("Cast: AirPlay /pair-pin-start OK, Apple TV should now "
-                  "show its code");
+        Log::info("Cast: AirPlay /pair-pin-start OK, Apple TV should now show its code");
         sendPairSetupM1_();
         break;
     case PairStage::SetupM2: handlePairSetupM2_(body); break;
@@ -1287,9 +1380,8 @@ void RaopSender::sendAuthSetup_() {
         0x4c,0xb6,0x8a,0x63,0x30,0x03,0x82,0x07,
         0xa9,0x4d,0xbd,0x50,0xd8,0xaa,0x46,0x5b,
         0x5d,0x8c,0x01,0x2a,0x0c,0x7e,0x1d,0x4e};
-    httpPost_(QByteArrayLiteral("/auth-setup"),
-              QByteArrayLiteral("application/octet-stream"),
-              QByteArray(reinterpret_cast<const char*>(kCurve25519Pub), 33));
+    httpPost_("/auth-setup", "application/octet-stream",
+              std::string(reinterpret_cast<const char*>(kCurve25519Pub), 33));
 }
 
 // ── HAP pair-setup (SRP) ──────────────────────────────────────────────
@@ -1307,9 +1399,7 @@ void RaopSender::sendPairPinStart_() {
     // HTTP 403, but that 403 is a SEPARATE access gate (the Mac receiver in
     // "Current User" mode refusing pairing wholesale), not /pair-pin-start.
     pairStage_ = PairStage::PinStart;
-    httpPost_(QByteArrayLiteral("/pair-pin-start"),
-              QByteArrayLiteral("application/octet-stream"),
-              QByteArray());
+    httpPost_("/pair-pin-start", "application/octet-stream", {});
 }
 
 void RaopSender::sendPairSetupM1_() {
@@ -1322,21 +1412,19 @@ void RaopSender::sendPairSetupM1_() {
         {tlv::Method, {0x00}},
         {tlv::State, {0x01}},
     };
-    if (authMethod_ == RaopDeviceInfo::Auth::HapTransient)
+    if (authMethod_ == Auth::HapTransient)
         m.push_back({tlv::Flags, {0x10}});   // TransientPairing
     pairStage_ = PairStage::SetupM2;
-    httpPost_(QByteArrayLiteral("/pair-setup"),
-              QByteArrayLiteral("application/octet-stream"),
-              toQB(tlv::encode(m)));
+    httpPost_("/pair-setup", "application/octet-stream", fromBytes(tlv::encode(m)));
 }
 
-void RaopSender::sendPairSetupM3_(const QString& pin) {
+void RaopSender::sendPairSetupM3_(const std::string& pin) {
     using namespace airplay;
     // Run SRP step1/step2 with the PIN against the stored salt+B.
     ap2_->srp = std::make_unique<SrpClient>();
-    ap2_->srp->start(pin.toStdString());
+    ap2_->srp->start(pin);
     if (!ap2_->srp->process(toBytes(srpSalt_), toBytes(srpServerB_))) {
-        fail_(tr("Pairing rejected the device's parameters"));
+        fail_("Pairing rejected the device's parameters");
         return;
     }
     tlv::Map m = {
@@ -1345,43 +1433,39 @@ void RaopSender::sendPairSetupM3_(const QString& pin) {
         {tlv::Proof, ap2_->srp->proofM1()},
     };
     pairStage_ = PairStage::SetupM4;
-    httpPost_(QByteArrayLiteral("/pair-setup"),
-              QByteArrayLiteral("application/octet-stream"),
-              toQB(tlv::encode(m)));
+    httpPost_("/pair-setup", "application/octet-stream", fromBytes(tlv::encode(m)));
 }
 
-void RaopSender::handlePairSetupM2_(const QByteArray& body) {
+void RaopSender::handlePairSetupM2_(const std::string& body) {
     using namespace airplay;
     const tlv::Map m = tlv::decode(toBytes(body));
     if (auto err = tlv::get(m, tlv::Error)) {
-        fail_(tr("The device rejected pairing (error %1)")
-                  .arg(err->empty() ? 0 : (*err)[0]));
+        fail_(Log::format("The device rejected pairing (error {})", err->empty() ? 0 : (*err)[0]));
         return;
     }
     auto salt = tlv::get(m, tlv::Salt);
     auto pub  = tlv::get(m, tlv::PublicKey);
-    if (!salt || !pub) { fail_(tr("Pairing setup response was incomplete")); return; }
-    srpSalt_    = toQB(*salt);
-    srpServerB_ = toQB(*pub);
-    if (authMethod_ == RaopDeviceInfo::Auth::HapTransient) {
+    if (!salt || !pub) { fail_("Pairing setup response was incomplete"); return; }
+    srpSalt_    = fromBytes(*salt);
+    srpServerB_ = fromBytes(*pub);
+    if (authMethod_ == Auth::HapTransient) {
         // Transient: no user interaction, fixed PIN 3939.
-        sendPairSetupM3_(QStringLiteral("3939"));
+        sendPairSetupM3_("3939");
     } else {
-        // Normal HAP PIN, ask the UI for the on-screen code.
+        // Normal HAP PIN, ask the caller for the on-screen code.
         waitingForPin_ = true;
-        timeout_.stop();
-        pinTimeout_.start();   // bounded user-driven wait (see ctor)
+        stopTimer_(handshakeTimeoutId_);
+        startOneShot_(pinTimeoutId_, kPinWaitTimeoutMs, [this] { onPinWaitTimeout_(); });
         Log::info("Cast: AirPlay HAP PIN pairing, waiting for code");
-        emit pinRequired(name_);
+        if (onPinRequired) onPinRequired(name_);
     }
 }
 
-void RaopSender::handlePairSetupM4_(const QByteArray& body) {
+void RaopSender::handlePairSetupM4_(const std::string& body) {
     using namespace airplay;
     const tlv::Map m = tlv::decode(toBytes(body));
     if (auto err = tlv::get(m, tlv::Error)) {
-        fail_(tr("Pairing PIN was not accepted (error %1)")
-                  .arg(err->empty() ? 0 : (*err)[0]));
+        fail_(Log::format("Pairing PIN was not accepted (error {})", err->empty() ? 0 : (*err)[0]));
         return;
     }
     // M4 carries the server proof M5 (HAP "Proof"); verify it.
@@ -1391,14 +1475,12 @@ void RaopSender::handlePairSetupM4_(const QByteArray& body) {
     }
     // Transient pairing stops at M4: derive the audio/control key from the
     // SRP shared secret and go straight to AP2 SETUP.
-    if (authMethod_ == RaopDeviceInfo::Auth::HapTransient) {
+    if (authMethod_ == Auth::HapTransient) {
         ap2_->sharedSecret = ap2_->srp->sessionKey();
         // Control-channel keys (read/write) per HAP.
-        ap2_->controlOut = hkdfSha512("Control-Salt",
-                                      "Control-Write-Encryption-Key",
+        ap2_->controlOut = hkdfSha512("Control-Salt", "Control-Write-Encryption-Key",
                                       ap2_->sharedSecret, 32);
-        ap2_->controlIn  = hkdfSha512("Control-Salt",
-                                      "Control-Read-Encryption-Key",
+        ap2_->controlIn  = hkdfSha512("Control-Salt", "Control-Read-Encryption-Key",
                                       ap2_->sharedSecret, 32);
         pairStage_ = PairStage::Done;
         afterAuthOk_();
@@ -1413,16 +1495,11 @@ void RaopSender::sendPairSetupM5_() {
     // Generate our long-term Ed25519 identity (persisted as credentials).
     if (ap2_->ltSeed.empty()) ap2_->ltSeed = randomBytes(32);
     ap2_->ltPub = ed25519PublicFromSeed(ap2_->ltSeed);
-    if (ap2_->pairingId.empty()) {
-        const QByteArray id =
-            QUuid::createUuid().toString(QUuid::WithoutBraces).toUtf8();
-        ap2_->pairingId = toBytes(id);
-    }
+    if (ap2_->pairingId.empty()) ap2_->pairingId = toBytes(makeUuid());
     // session_key = HKDF(Pair-Setup-Encrypt) over K; the signed material is
     // HKDF(Pair-Setup-Controller-Sign) || pairingId || ltPub.
     const Bytes K = ap2_->srp->sessionKey();
-    const Bytes sessionKey = hkdfSha512("Pair-Setup-Encrypt-Salt",
-                                        "Pair-Setup-Encrypt-Info", K, 32);
+    const Bytes sessionKey = hkdfSha512("Pair-Setup-Encrypt-Salt", "Pair-Setup-Encrypt-Info", K, 32);
     const Bytes iosDeviceX = hkdfSha512("Pair-Setup-Controller-Sign-Salt",
                                         "Pair-Setup-Controller-Sign-Info", K, 32);
     Bytes deviceInfo = iosDeviceX;
@@ -1438,51 +1515,43 @@ void RaopSender::sendPairSetupM5_() {
     // HAP setup messages use a STRING-label nonce ("PS-Msg05"), the 8
     // ASCII bytes sit in the low 8 of the 12-byte IETF nonce (the 4-byte
     // zero pad is added by chacha20Poly1305Encrypt).
-    const Bytes nonceM5 = toBytes(QByteArrayLiteral("PS-Msg05"));
-    const Bytes enc = chacha20Poly1305Encrypt(sessionKey, nonceM5,
-                                              tlv::encode(inner), {});
+    const Bytes nonceM5 = toBytes(std::string("PS-Msg05"));
+    const Bytes enc = chacha20Poly1305Encrypt(sessionKey, nonceM5, tlv::encode(inner), {});
     tlv::Map m = {
         {tlv::State, {0x05}},
         {tlv::EncryptedData, enc},
     };
-    // Stash the M5 session key so M6 can decrypt the reply. (pairVerifyKey_
+    // Stash the M5 session key so M6 can decrypt the reply. (pairSetupSessionKey_
     // is a dedicated scratch field, not the audio key.)
     pairSetupSessionKey_ = sessionKey;
     pairStage_ = PairStage::SetupM6;
-    httpPost_(QByteArrayLiteral("/pair-setup"),
-              QByteArrayLiteral("application/octet-stream"),
-              toQB(tlv::encode(m)));
+    httpPost_("/pair-setup", "application/octet-stream", fromBytes(tlv::encode(m)));
 }
 
-void RaopSender::handlePairSetupM6_(const QByteArray& body) {
+void RaopSender::handlePairSetupM6_(const std::string& body) {
     using namespace airplay;
     const tlv::Map m = tlv::decode(toBytes(body));
     if (auto err = tlv::get(m, tlv::Error)) {
-        fail_(tr("Pairing finalisation failed (error %1)")
-                  .arg(err->empty() ? 0 : (*err)[0]));
+        fail_(Log::format("Pairing finalisation failed (error {})", err->empty() ? 0 : (*err)[0]));
         return;
     }
     auto encrypted = tlv::get(m, tlv::EncryptedData);
-    if (!encrypted) { fail_(tr("Pairing M6 response was incomplete")); return; }
+    if (!encrypted) { fail_("Pairing M6 response was incomplete"); return; }
     const Bytes sessionKey = pairSetupSessionKey_;   // stashed in M5
-    const Bytes nonceM6 = toBytes(QByteArrayLiteral("PS-Msg06"));
+    const Bytes nonceM6 = toBytes(std::string("PS-Msg06"));
     auto dec = chacha20Poly1305Decrypt(sessionKey, nonceM6, *encrypted, {});
-    if (!dec) { fail_(tr("Pairing M6 could not be decrypted")); return; }
+    if (!dec) { fail_("Pairing M6 could not be decrypted"); return; }
     const tlv::Map sub = tlv::decode(*dec);
     auto atvId  = tlv::get(sub, tlv::Identifier);
     auto atvLtpk = tlv::get(sub, tlv::PublicKey);
-    if (!atvId || !atvLtpk) { fail_(tr("Pairing M6 was missing device keys")); return; }
+    if (!atvId || !atvLtpk) { fail_("Pairing M6 was missing device keys"); return; }
     ap2_->accessoryId   = *atvId;
     ap2_->accessoryLtpk = *atvLtpk;
 
     // Persist the long-term credentials so later connects skip the PIN.
-    QJsonObject o;
-    o.insert("ltsk", QString::fromLatin1(toQB(ap2_->ltSeed).toHex()));
-    o.insert("ltpk", QString::fromLatin1(toQB(*atvLtpk).toHex()));
-    o.insert("atvId", QString::fromLatin1(toQB(*atvId).toHex()));
-    o.insert("clientId", QString::fromUtf8(toQB(ap2_->pairingId)));
-    const QString creds = QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact));
-    emit credentialsObtained(deviceId_, creds);
+    const std::string creds = encodeCreds(toHex(ap2_->ltSeed), toHex(*atvLtpk),
+                                          toHex(*atvId), fromBytes(ap2_->pairingId));
+    if (onCredentialsObtained) onCredentialsObtained(deviceId_, creds);
     Log::info("Cast: AirPlay HAP pairing complete, credentials stored");
 
     // Now run pair-verify to derive the live session keys.
@@ -1500,46 +1569,41 @@ void RaopSender::sendPairVerifyM1_() {
         {tlv::PublicKey, ap2_->verifyKeys.pub},
     };
     pairStage_ = PairStage::VerifyM2;
-    httpPost_(QByteArrayLiteral("/pair-verify"),
-              QByteArrayLiteral("application/octet-stream"),
-              toQB(tlv::encode(m)));
+    httpPost_("/pair-verify", "application/octet-stream", fromBytes(tlv::encode(m)));
 }
 
-void RaopSender::handlePairVerifyM2_(const QByteArray& body) {
+void RaopSender::handlePairVerifyM2_(const std::string& body) {
     using namespace airplay;
     const tlv::Map m = tlv::decode(toBytes(body));
     if (auto err = tlv::get(m, tlv::Error)) {
-        fail_(tr("Pair-verify rejected (error %1)")
-                  .arg(err->empty() ? 0 : (*err)[0]));
+        fail_(Log::format("Pair-verify rejected (error {})", err->empty() ? 0 : (*err)[0]));
         return;
     }
     auto sessionPub = tlv::get(m, tlv::PublicKey);
     auto encrypted  = tlv::get(m, tlv::EncryptedData);
-    if (!sessionPub || !encrypted) { fail_(tr("Pair-verify response incomplete")); return; }
+    if (!sessionPub || !encrypted) { fail_("Pair-verify response incomplete"); return; }
 
     // Shared secret + verify session key.
     ap2_->sharedSecret = x25519SharedSecret(ap2_->verifyKeys.priv, *sessionPub);
     if (ap2_->sharedSecret.empty()) {   // malformed/low-order sessionPub
-        fail_(tr("Pair-verify shared-secret derivation failed"));
+        fail_("Pair-verify shared-secret derivation failed");
         return;
     }
-    const Bytes verifyKey = hkdfSha512("Pair-Verify-Encrypt-Salt",
-                                       "Pair-Verify-Encrypt-Info",
+    const Bytes verifyKey = hkdfSha512("Pair-Verify-Encrypt-Salt", "Pair-Verify-Encrypt-Info",
                                        ap2_->sharedSecret, 32);
-    const Bytes nonce02 = toBytes(QByteArrayLiteral("PV-Msg02"));
+    const Bytes nonce02 = toBytes(std::string("PV-Msg02"));
     auto dec = chacha20Poly1305Decrypt(verifyKey, nonce02, *encrypted, {});
-    if (!dec) { fail_(tr("Pair-verify could not be decrypted")); return; }
+    if (!dec) { fail_("Pair-verify could not be decrypted"); return; }
     const tlv::Map sub = tlv::decode(*dec);
     auto atvId = tlv::get(sub, tlv::Identifier);
     auto atvSig = tlv::get(sub, tlv::Signature);
-    if (!atvId || !atvSig) { fail_(tr("Pair-verify was missing the device signature")); return; }
+    if (!atvId || !atvSig) { fail_("Pair-verify was missing the device signature"); return; }
 
     // Verify the accessory's signature over sessionPub || atvId || ourPub.
     if (!ap2_->accessoryLtpk.empty()) {
         Bytes info = *sessionPub;
         info.insert(info.end(), atvId->begin(), atvId->end());
-        info.insert(info.end(), ap2_->verifyKeys.pub.begin(),
-                    ap2_->verifyKeys.pub.end());
+        info.insert(info.end(), ap2_->verifyKeys.pub.begin(), ap2_->verifyKeys.pub.end());
         if (!ed25519Verify(ap2_->accessoryLtpk, info, *atvSig))
             Log::warn("Cast: AirPlay pair-verify signature mismatch (continuing)");
     }
@@ -1553,37 +1617,30 @@ void RaopSender::handlePairVerifyM2_(const QByteArray& body) {
         {tlv::Identifier, ap2_->pairingId},
         {tlv::Signature, sig},
     };
-    const Bytes nonce03 = toBytes(QByteArrayLiteral("PV-Msg03"));
-    const Bytes enc = chacha20Poly1305Encrypt(verifyKey, nonce03,
-                                              tlv::encode(innerOut), {});
+    const Bytes nonce03 = toBytes(std::string("PV-Msg03"));
+    const Bytes enc = chacha20Poly1305Encrypt(verifyKey, nonce03, tlv::encode(innerOut), {});
     tlv::Map mOut = {
         {tlv::State, {0x03}},
         {tlv::EncryptedData, enc},
     };
     // After M3 the receiver enables encryption on the control channel; the
     // SETUP plist exchange proceeds. Derive the control keys now.
-    ap2_->controlOut = hkdfSha512("Control-Salt",
-                                  "Control-Write-Encryption-Key",
+    ap2_->controlOut = hkdfSha512("Control-Salt", "Control-Write-Encryption-Key",
                                   ap2_->sharedSecret, 32);
-    ap2_->controlIn  = hkdfSha512("Control-Salt",
-                                  "Control-Read-Encryption-Key",
+    ap2_->controlIn  = hkdfSha512("Control-Salt", "Control-Read-Encryption-Key",
                                   ap2_->sharedSecret, 32);
     // #90/#109, event-channel keys (pyatv/owntone "Events-Salt"). The event
     // channel is a REVERSE connection, so the read/write keys are SWAPPED vs the
     // control channel: we DECRYPT the receiver's pushed events with the
     // "Events-Write" key and ENCRYPT our 200-OK responses with "Events-Read".
-    ap2_->eventIn  = hkdfSha512("Events-Salt",
-                                "Events-Write-Encryption-Key",
+    ap2_->eventIn  = hkdfSha512("Events-Salt", "Events-Write-Encryption-Key",
                                 ap2_->sharedSecret, 32);
-    ap2_->eventOut = hkdfSha512("Events-Salt",
-                                "Events-Read-Encryption-Key",
+    ap2_->eventOut = hkdfSha512("Events-Salt", "Events-Read-Encryption-Key",
                                 ap2_->sharedSecret, 32);
     // Send M3, then (on its 200) proceed to AP2 SETUP. The next reply is
     // routed via the VerifyDone stage.
     pairStage_ = PairStage::VerifyDone;
-    httpPost_(QByteArrayLiteral("/pair-verify"),
-              QByteArrayLiteral("application/octet-stream"),
-              toQB(tlv::encode(mOut)));
+    httpPost_("/pair-verify", "application/octet-stream", fromBytes(tlv::encode(mOut)));
 }
 
 // ── AirPlay 2 binary-plist SETUP ──────────────────────────────────────
@@ -1593,34 +1650,33 @@ void RaopSender::handlePairVerifyM2_(const QByteArray& body) {
 // RECORD → SET_PARAMETER volume. Critically these are RTSP *methods*, not a
 // `POST /setup` HTTP path (which 404s). The replies carry a binary-plist body,
 // so they route through the body-capturing pairing dispatcher.
-void RaopSender::sendAp2Rtsp_(const QByteArray& method, const QByteArray& uri,
-                              const QByteArray& contentType,
-                              const QByteArray& body) {
-    QByteArray req = method + " " + uri + " RTSP/1.0\r\n";
-    req += "CSeq: " + QByteArray::number(cseq_++) + "\r\n";
+void RaopSender::sendAp2Rtsp_(const std::string& method, const std::string& uri,
+                              const std::string& contentType, const std::string& body) {
+    std::string req = method + " " + uri + " RTSP/1.0\r\n";
+    req += "CSeq: " + std::to_string(cseq_++) + "\r\n";
     req += "User-Agent: AirPlay/550.10\r\n";
     req += "DACP-ID: " + dacpId_ + "\r\n";
-    req += "Active-Remote: " + QByteArray::number(activeRemote_) + "\r\n";
+    req += "Active-Remote: " + std::to_string(activeRemote_) + "\r\n";
     req += "Client-Instance: " + dacpId_ + "\r\n";
     req += "X-Apple-Client-Name: FXChainPlayer\r\n";
     if (method == "SETUP")
         req += "X-Apple-StreamID: 1\r\n";        // owntone/pyatv parity
-    if (!contentType.isEmpty())
+    if (!contentType.empty())
         req += "Content-Type: " + contentType + "\r\n";
-    if (!body.isEmpty())
-        req += "Content-Length: " + QByteArray::number(body.size()) + "\r\n";
+    if (!body.empty())
+        req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
     req += "\r\n";
     req += body;
-    pendingMethods_.append(method);
-    pendingIsHttp_.append(true);   // reply has a plist body → pairing dispatcher
+    pendingMethods_.push_back(method);
+    pendingIsHttp_.push_back(true);   // reply has a plist body → pairing dispatcher
     writeRtsp_(req);
-    timeout_.start();
+    startHandshakeTimeout_();
 }
 
 void RaopSender::sendAp2Info_() {
     // GET /info (path GET on the RTSP control channel), required before SETUP.
     pairStage_ = PairStage::Ap2Info;
-    sendAp2Rtsp_(QByteArrayLiteral("GET"), QByteArrayLiteral("/info"), {}, {});
+    sendAp2Rtsp_("GET", "/info", {}, {});
 }
 
 void RaopSender::sendAp2SetupSession_() {
@@ -1628,8 +1684,8 @@ void RaopSender::sendAp2SetupSession_() {
     // Session-level SETUP: timing over NTP (no PTP/nqptp), event channel.
     Dict d;
     d.emplace_back("deviceID", Value::str("AA:BB:CC:DD:EE:FF"));
-    d.emplace_back("sessionUUID", Value::str(ap2_->sessionUuid.toStdString()));
-    d.emplace_back("timingPort", Value::integer(timingSock_.localPort()));
+    d.emplace_back("sessionUUID", Value::str(ap2_->sessionUuid));
+    d.emplace_back("timingPort", Value::integer(transport_.localPort(timingHandle_)));
     d.emplace_back("timingProtocol", Value::str("NTP"));
     d.emplace_back("isMultiSelectAirPlay", Value::boolean(true));
     d.emplace_back("groupContainsGroupLeader", Value::boolean(false));
@@ -1644,31 +1700,30 @@ void RaopSender::sendAp2SetupSession_() {
     d.emplace_back("statsCollectionEnabled", Value::boolean(false));
     const auto body = airplay::bplist::encode(Value::object(std::move(d)));
     pairStage_ = PairStage::Ap2Session;
-    sendAp2Rtsp_(QByteArrayLiteral("SETUP"), rtspUri_(),
-                 QByteArrayLiteral("application/x-apple-binary-plist"),
-                 toQB(body));
+    sendAp2Rtsp_("SETUP", rtspUri_(), "application/x-apple-binary-plist", fromBytes(body));
     // #150 diag, confirm the session SETUP went out; the MacBook stall shows
     // this line then silence (no "session SETUP ok", no control rx).
-    Log::info("Cast: AirPlay 2 session SETUP sent ({} plist bytes), awaiting reply",
-              int(body.size()));
+    Log::info("Cast: AirPlay 2 session SETUP sent ({} plist bytes), awaiting reply", body.size());
 }
 
-void RaopSender::handleAp2SetupSession_(const QByteArray& body) {
+void RaopSender::handleAp2SetupSession_(const std::string& body) {
     using namespace airplay::bplist;
     auto root = decode(toBytes(body));
     if (root) {
         if (auto* ep = root->find("eventPort"))
-            ap2_->eventPort = quint16(ep->asInt());
+            ap2_->eventPort = uint16_t(ep->asInt());
     }
     Log::info("Cast: AirPlay 2 session SETUP ok, eventPort={}", ap2_->eventPort);
     // #90, a modern Apple TV needs the event-channel TCP connection OPEN and
     // RECORD accepted BEFORE the stream SETUP. Open the event channel, then
     // send RECORD; the stream SETUP follows on the RECORD reply.
     if (ap2_->eventPort != 0) {
-        eventSock_.abort();
-        eventSock_.connectToHost(hostAddr_, ap2_->eventPort);
-        Log::info("Cast: AirPlay 2 opening event channel -> {}:{}",
-                  host_.toStdString(), ap2_->eventPort);
+        if (eventHandle_ != kNoHandle) { transport_.close(eventHandle_); eventHandle_ = kNoHandle; }
+        eventHandle_ = transport_.tcpConnect(host_, ap2_->eventPort,
+            {},   // nothing to do once connected; we only ever answer pushed events
+            [this](const uint8_t* d, size_t n, const std::string&, uint16_t) { onEventData_(d, n); },
+            [this](const std::string& reason) { onEventClosed_(reason); });
+        Log::info("Cast: AirPlay 2 opening event channel -> {}:{}", host_, ap2_->eventPort);
     }
     sendAp2Record_();
 }
@@ -1678,7 +1733,7 @@ void RaopSender::sendAp2Record_() {
     // right after session SETUP, BEFORE the stream SETUP. The receiver enters
     // its RECORD state, required before it will render the realtime stream.
     pairStage_ = PairStage::Ap2Record;
-    sendAp2Rtsp_(QByteArrayLiteral("RECORD"), rtspUri_(), {}, {});
+    sendAp2Rtsp_("RECORD", rtspUri_(), {}, {});
 }
 
 void RaopSender::sendAp2SetupStream_() {
@@ -1696,7 +1751,7 @@ void RaopSender::sendAp2SetupStream_() {
     //     = 64 bytes (transient stops at pair-setup M4, no pair-verify).
     // owntone airplay.c AIRPLAY_AUDIO_KEY_LEN: "for transient pairing the
     // key_len will be 64 bytes, but only 32 are used for audio payload
-    // encryption", chacha_open() takes the FIRST 32, and `shk` carries the
+    // encryption," chacha_open() takes the FIRST 32, and `shk` carries the
     // same 32. Passing all 64 made chacha20Poly1305Encrypt throw
     // ("chacha key size") on every packet → zero audio sent → the MacBook
     // dropped the (otherwise healthy) session after its ~30 s no-audio
@@ -1714,7 +1769,7 @@ void RaopSender::sendAp2SetupStream_() {
     // ignored). We therefore ALAC-encode each packet (see encodeAlacFrame_).
     stream.emplace_back("audioFormat", Value::integer(0x40000));  // ALAC/44100/16/2
     stream.emplace_back("audioMode", Value::str("default"));
-    stream.emplace_back("controlPort", Value::integer(controlSock_.localPort()));
+    stream.emplace_back("controlPort", Value::integer(transport_.localPort(controlHandle_)));
     stream.emplace_back("ct", Value::integer(2));        // ALAC
     stream.emplace_back("isMedia", Value::boolean(true));
     stream.emplace_back("latencyMax", Value::integer(88200));
@@ -1726,19 +1781,17 @@ void RaopSender::sendAp2SetupStream_() {
     stream.emplace_back("supportsDynamicStreamID", Value::boolean(false));
     // owntone/pyatv: streamConnectionID is the numeric RTSP session id (uint),
     // not a separate random string.
-    stream.emplace_back("streamConnectionID", Value::integer(qint64(sessionId_)));
+    stream.emplace_back("streamConnectionID", Value::integer(int64_t(sessionId_)));
     Array streams;
     streams.push_back(Value::object(std::move(stream)));
     Dict d;
     d.emplace_back("streams", Value::array(std::move(streams)));
     const auto reqBody = airplay::bplist::encode(Value::object(std::move(d)));
     pairStage_ = PairStage::Ap2Stream;
-    sendAp2Rtsp_(QByteArrayLiteral("SETUP"), rtspUri_(),
-                 QByteArrayLiteral("application/x-apple-binary-plist"),
-                 toQB(reqBody));
+    sendAp2Rtsp_("SETUP", rtspUri_(), "application/x-apple-binary-plist", fromBytes(reqBody));
 }
 
-void RaopSender::handleAp2SetupStream_(const QByteArray& body) {
+void RaopSender::handleAp2SetupStream_(const std::string& body) {
     using namespace airplay::bplist;
     auto root = decode(toBytes(body));
     serverPort_ = controlPort_ = 0;
@@ -1746,13 +1799,13 @@ void RaopSender::handleAp2SetupStream_(const QByteArray& body) {
         if (auto* streams = root->find("streams")) {
             if (streams->type == Value::Type::Arr && !streams->arr.empty()) {
                 const Value& s0 = streams->arr.front();
-                if (auto* dp = s0.find("dataPort"))    serverPort_  = quint16(dp->asInt());
-                if (auto* cp = s0.find("controlPort")) controlPort_ = quint16(cp->asInt());
+                if (auto* dp = s0.find("dataPort"))    serverPort_  = uint16_t(dp->asInt());
+                if (auto* cp = s0.find("controlPort")) controlPort_ = uint16_t(cp->asInt());
             }
         }
     }
     if (serverPort_ == 0) {
-        fail_(tr("AirPlay 2 stream SETUP returned no data port"));
+        fail_("AirPlay 2 stream SETUP returned no data port");
         return;
     }
     // AP2 has no separate sync 'control_port' on the receiver in the AP1
@@ -1769,20 +1822,19 @@ void RaopSender::handleAp2SetupStream_(const QByteArray& body) {
 
 // ── per-session audio encryption hook ─────────────────────────────────
 
-QByteArray RaopSender::encryptAudioPayload_(const QByteArray& rtpHeader,
-                                            const QByteArray& payload) {
+std::string RaopSender::encryptAudioPayload_(const std::string& rtpHeader,
+                                             const std::string& payload) {
     if (!ap2_ || !ap2_->encryptAudio) return payload;   // AP1 = identity
     // pyatv send_audio_packet: AAD = RTP header bytes 4..12 (8 bytes);
     // nonce = the 8-byte little-endian counter; the 8-byte nonce is
     // appended AFTER the ciphertext+tag.
-    const airplay::Bytes nonce8 = airplay::counterNonce8(ap2_->audioNonce);
-    airplay::Bytes aad(rtpHeader.constData() + 4, rtpHeader.constData() + 12);
-    airplay::Bytes pt(payload.constData(), payload.constData() + payload.size());
-    airplay::Bytes ct = airplay::chacha20Poly1305Encrypt(
-        ap2_->audioKey, nonce8, pt, aad);
+    const Bytes nonce8 = airplay::counterNonce8(ap2_->audioNonce);
+    const Bytes aad(rtpHeader.begin() + 4, rtpHeader.begin() + 12);
+    const Bytes pt(payload.begin(), payload.end());
+    Bytes ct = airplay::chacha20Poly1305Encrypt(ap2_->audioKey, nonce8, pt, aad);
     ++ap2_->audioNonce;
-    QByteArray out = toQB(ct);
-    out.append(toQB(nonce8));   // trailing 8-byte nonce
+    std::string out = fromBytes(ct);
+    out += fromBytes(nonce8);   // trailing 8-byte nonce
     return out;
 }
 
@@ -1790,11 +1842,12 @@ QByteArray RaopSender::encryptAudioPayload_(const QByteArray& rtpHeader,
 
 void RaopSender::onPacerTick_() {
     // Token bucket: frames-on-the-wire must track wall clock at
-    // 44100/s (pyatv paces identically off monotonic time). A GUI
-    // stall is repaid in bursts, capped so we never flood the LAN,
+    // 44100/s (pyatv paces identically off monotonic time). A stall
+    // is repaid in bursts, capped so we never flood the LAN,
     // the receiver buffers ~2 s, so a capped catch-up is inaudible.
-    const quint64 target =
-        quint64(clock_.nsecsElapsed()) * kRaopRate / 1000000000ULL;
+    const uint64_t elapsedNs = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - clockStart_).count());
+    const uint64_t target = elapsedNs * kRaopRate / 1000000000ULL;
     int sentThisTick = 0;
     while (framesSent_ + kFramesPerPacket <= target
            && sentThisTick < kMaxPacketsPerTick) {
@@ -1811,15 +1864,15 @@ void RaopSender::onPacerTick_() {
 //   1b hasSize=0 (use cookie's default 352) · 2b wastedBytes=0 ·
 //   1b isNotCompressed=1 · then nFrames×{L16,R16} samples MSB-first ·
 //   3b end tag = 7 · zero-pad to a byte boundary.
-QByteArray RaopSender::encodeAlacFrame_(const int16_t* frames, int nFrames) {
-    QByteArray out;
-    out.reserve(nFrames * kChannels * 2 + 8);
-    quint8 cur = 0;
+std::string RaopSender::encodeAlacFrame_(const int16_t* frames, int nFrames) {
+    std::string out;
+    out.reserve(size_t(nFrames) * kChannels * 2 + 8);
+    uint8_t cur = 0;
     int filled = 0;   // bits currently in `cur` (0..7)
-    auto put = [&](quint32 value, int bits) {
+    auto put = [&](uint32_t value, int bits) {
         for (int i = bits - 1; i >= 0; --i) {
-            cur = quint8((cur << 1) | ((value >> i) & 1u));
-            if (++filled == 8) { out.append(char(cur)); cur = 0; filled = 0; }
+            cur = uint8_t((cur << 1) | ((value >> i) & 1u));
+            if (++filled == 8) { out += char(cur); cur = 0; filled = 0; }
         }
     };
     put(1, 3);    // stereo channel-pair element
@@ -1829,9 +1882,9 @@ QByteArray RaopSender::encodeAlacFrame_(const int16_t* frames, int nFrames) {
     put(0, 2);    // wastedBytes = 0
     put(1, 1);    // isNotCompressed = 1 (uncompressed escape)
     for (int i = 0; i < nFrames * kChannels; ++i)
-        put(quint16(frames[i]), 16);   // 16-bit sample, MSB-first
+        put(uint16_t(frames[i]), 16);   // 16-bit sample, MSB-first
     put(7, 3);    // END element tag
-    if (filled > 0) { cur = quint8(cur << (8 - filled)); out.append(char(cur)); }
+    if (filled > 0) { cur = uint8_t(cur << (8 - filled)); out += char(cur); }
     return out;
 }
 
@@ -1840,7 +1893,7 @@ void RaopSender::sendAudioPacket_() {
     fillFrames_(frames, kFramesPerPacket);
 
     // 12-byte RTP header (big-endian, shared by AP1 + AP2).
-    QByteArray header;
+    std::string header;
     header.reserve(12);
     b8(header, 0x80);
     b8(header, firstAudio_ ? 0xE0 : 0x60);   // marker on the first packet
@@ -1852,13 +1905,13 @@ void RaopSender::sendAudioPacket_() {
     //  • AP2 realtime (type 0x60) is HARDCODED ALAC on the receiver → send an
     //    uncompressed-ALAC frame (#90).
     //  • AP1 RAOP announces L16 (RFC 3551) → BIG-endian s16 raw PCM.
-    QByteArray payload;
+    std::string payload;
     if (ap2_ && ap2_->encryptAudio) {
         payload = encodeAlacFrame_(frames, kFramesPerPacket);
     } else {
         payload.reserve(kPayloadBytes);
         for (int i = 0; i < kFramesPerPacket * kChannels; ++i) {
-            const quint16 s = quint16(frames[i]);
+            const uint16_t s = uint16_t(frames[i]);
             payload += char(s >> 8);
             payload += char(s & 0xFF);
         }
@@ -1866,19 +1919,20 @@ void RaopSender::sendAudioPacket_() {
 
     // v0.66.x Phase 3, AP2 receivers get the payload ChaCha20-Poly1305
     // encrypted (AAD = header[4..12], trailing 8-byte nonce). AP1 = identity.
-    const QByteArray wirePayload = encryptAudioPayload_(header, payload);
+    const std::string wirePayload = encryptAudioPayload_(header, payload);
 
-    QByteArray pkt = header;
+    std::string pkt = header;
     pkt += wirePayload;
-    audioSock_.writeDatagram(pkt, hostAddr_, serverPort_);
+    transport_.sendTo(audioHandle_, host_, serverPort_,
+                      reinterpret_cast<const uint8_t*>(pkt.data()), pkt.size());
 
     // Retransmit backlog (the receiver asks by seq via type 0x55).
     const int slot = seq_ & (kBacklogSize - 1);
-    backlog_[slot] = pkt;
-    backlogSeq_[slot] = seq_;
+    backlog_[size_t(slot)] = pkt;
+    backlogSeq_[size_t(slot)] = seq_;
 
     firstAudio_ = false;
-    seq_ = quint16(seq_ + 1);
+    seq_ = uint16_t(seq_ + 1);
     framesSent_ += kFramesPerPacket;
 }
 
@@ -1918,8 +1972,7 @@ size_t RaopSender::fillFrames_(int16_t* dst, size_t want) {
     if (pull > 0) {
         const size_t old = inBuf_.size();
         inBuf_.resize(old + pull * kChannels);
-        ring_->tryPop(std::span<int16_t>(inBuf_.data() + old,
-                                         pull * kChannels));
+        ring_->tryPop(std::span<int16_t>(inBuf_.data() + old, pull * kChannels));
         bufFrames += pull;
     }
 
@@ -1930,10 +1983,8 @@ size_t RaopSender::fillFrames_(int16_t* dst, size_t want) {
         const double frac = srcPhase_ - double(i0);
         const int16_t* a = inBuf_.data() + i0 * kChannels;
         const int16_t* b = a + kChannels;
-        dst[produced * 2 + 0] =
-            int16_t(a[0] + (b[0] - a[0]) * frac);
-        dst[produced * 2 + 1] =
-            int16_t(a[1] + (b[1] - a[1]) * frac);
+        dst[produced * 2 + 0] = int16_t(a[0] + (b[0] - a[0]) * frac);
+        dst[produced * 2 + 1] = int16_t(a[1] + (b[1] - a[1]) * frac);
         srcPhase_ += step;
         ++produced;
     }
@@ -1946,8 +1997,7 @@ size_t RaopSender::fillFrames_(int16_t* dst, size_t want) {
     const size_t keepFrom = size_t(srcPhase_);
     if (keepFrom > 0) {
         const size_t drop = std::min(keepFrom, bufFrames);
-        inBuf_.erase(inBuf_.begin(),
-                     inBuf_.begin() + qsizetype(drop * kChannels));
+        inBuf_.erase(inBuf_.begin(), inBuf_.begin() + static_cast<std::ptrdiff_t>(drop * kChannels));
         srcPhase_ -= double(drop);
     }
     return produced;
@@ -1959,76 +2009,65 @@ void RaopSender::sendSyncPacket_(bool first) {
     // (head_ts ≙ startTs_+framesSent_) onto NTP wall time; `now` is the
     // latency-shifted RTP time the audio headers carry, and
     // `now_without_latency` is where the receiver should be PLAYING.
-    const quint64 curNtp = ts2ntp(startTs_ + framesSent_, kRaopRate);
-    const quint32 now = rtptime32_();
-    QByteArray pkt;
+    const uint64_t curNtp = ts2ntp(startTs_ + framesSent_, kRaopRate);
+    const uint32_t now = rtptime32_();
+    std::string pkt;
     pkt.reserve(20);
     b8(pkt, first ? 0x90 : 0x80);   // marker on the first sync
     b8(pkt, 0xD4);                  // type 0x54 | 0x80
     be16(pkt, 0x0007);
     be32(pkt, now - latency_);
-    be32(pkt, quint32(curNtp >> 32));
-    be32(pkt, quint32(curNtp & 0xFFFFFFFFULL));
+    be32(pkt, uint32_t(curNtp >> 32));
+    be32(pkt, uint32_t(curNtp & 0xFFFFFFFFULL));
     be32(pkt, now);
-    controlSock_.writeDatagram(pkt, hostAddr_, controlPort_);
+    transport_.sendTo(controlHandle_, host_, controlPort_,
+                      reinterpret_cast<const uint8_t*>(pkt.data()), pkt.size());
 }
 
-void RaopSender::onControlDatagram_() {
-    while (controlSock_.hasPendingDatagrams()) {
-        QByteArray dg;
-        dg.resize(int(controlSock_.pendingDatagramSize()));
-        QHostAddress from;
-        quint16 fromPort = 0;
-        controlSock_.readDatagram(dg.data(), dg.size(), &from, &fromPort);
-        if (dg.size() < 8) continue;
-        const quint8 type = quint8(dg[1]) & 0x7F;
-        if (type != 0x55) continue;   // only retransmit requests expected
-        // RetransmitRequest: lost_seqno u16 @4, lost_packets u16 @6.
-        const quint16 lostSeq =
-            quint16((quint8(dg[4]) << 8) | quint8(dg[5]));
-        const quint16 lostCount =
-            quint16((quint8(dg[6]) << 8) | quint8(dg[7]));
-        for (quint16 i = 0; i < lostCount; ++i) {
-            const quint16 s = quint16(lostSeq + i);
-            const int slot = s & (kBacklogSize - 1);
-            if (backlogSeq_[slot] != s) continue;   // aged out of backlog
-            // pyatv: 0x80 0xD6 + original seq + the FULL original packet.
-            QByteArray resp;
-            resp.reserve(4 + backlog_[slot].size());
-            b8(resp, 0x80);
-            b8(resp, 0xD6);
-            be16(resp, s);
-            resp += backlog_[slot];
-            controlSock_.writeDatagram(resp, from, fromPort);
-        }
+void RaopSender::onControlData_(const uint8_t* data, size_t len,
+                                const std::string& fromHost, uint16_t fromPort) {
+    if (len < 8) return;
+    const uint8_t type = data[1] & 0x7F;
+    if (type != 0x55) return;   // only retransmit requests expected
+    // RetransmitRequest: lost_seqno u16 @4, lost_packets u16 @6.
+    const uint16_t lostSeq   = uint16_t((uint16_t(data[4]) << 8) | data[5]);
+    const uint16_t lostCount = uint16_t((uint16_t(data[6]) << 8) | data[7]);
+    for (uint16_t i = 0; i < lostCount; ++i) {
+        const uint16_t s = uint16_t(lostSeq + i);
+        const int slot = s & (kBacklogSize - 1);
+        if (backlogSeq_[size_t(slot)] != s) continue;   // aged out of backlog
+        // pyatv: 0x80 0xD6 + original seq + the FULL original packet.
+        std::string resp;
+        resp.reserve(4 + backlog_[size_t(slot)].size());
+        b8(resp, 0x80);
+        b8(resp, 0xD6);
+        be16(resp, s);
+        resp += backlog_[size_t(slot)];
+        transport_.sendTo(controlHandle_, fromHost, fromPort,
+                          reinterpret_cast<const uint8_t*>(resp.data()), resp.size());
     }
 }
 
-void RaopSender::onTimingDatagram_() {
-    while (timingSock_.hasPendingDatagrams()) {
-        QByteArray dg;
-        dg.resize(int(timingSock_.pendingDatagramSize()));
-        QHostAddress from;
-        quint16 fromPort = 0;
-        timingSock_.readDatagram(dg.data(), dg.size(), &from, &fromPort);
-        if (dg.size() < 32) continue;   // TimingPacket is 32 bytes
-        // pyatv TimingServer.datagram_received: echo the request's
-        // sendtime as our reftime; receive + send time = NTP "now"
-        // (one wall-clock read is plenty at this precision).
-        const quint64 now = ntpNow_();
-        QByteArray resp;
-        resp.reserve(32);
-        resp += dg[0];                       // proto byte echoed
-        b8(resp, 0xD3);                      // type 0x53 | 0x80
-        be16(resp, 0x0007);
-        be32(resp, 0);                       // padding
-        resp += dg.mid(24, 8);               // reftime = request sendtime
-        be32(resp, quint32(now >> 32));      // recvtime
-        be32(resp, quint32(now & 0xFFFFFFFFULL));
-        be32(resp, quint32(now >> 32));      // sendtime
-        be32(resp, quint32(now & 0xFFFFFFFFULL));
-        timingSock_.writeDatagram(resp, from, fromPort);
-    }
+void RaopSender::onTimingData_(const uint8_t* data, size_t len,
+                               const std::string& fromHost, uint16_t fromPort) {
+    if (len < 32) return;   // TimingPacket is 32 bytes
+    // pyatv TimingServer.datagram_received: echo the request's
+    // sendtime as our reftime; receive + send time = NTP "now"
+    // (one wall-clock read is plenty at this precision).
+    const uint64_t now = ntpNow_();
+    std::string resp;
+    resp.reserve(32);
+    resp += char(data[0]);               // proto byte echoed
+    b8(resp, 0xD3);                      // type 0x53 | 0x80
+    be16(resp, 0x0007);
+    be32(resp, 0);                       // padding
+    resp.append(reinterpret_cast<const char*>(data + 24), 8);   // reftime = request sendtime
+    be32(resp, uint32_t(now >> 32));     // recvtime
+    be32(resp, uint32_t(now & 0xFFFFFFFFULL));
+    be32(resp, uint32_t(now >> 32));     // sendtime
+    be32(resp, uint32_t(now & 0xFFFFFFFFULL));
+    transport_.sendTo(timingHandle_, fromHost, fromPort,
+                      reinterpret_cast<const uint8_t*>(resp.data()), resp.size());
 }
 
 } // namespace fxchain

@@ -1,8 +1,11 @@
-# airplay 2 sender, build the Qt-free crypto + wire-format core.
+# airplay 2 sender, build the Qt-free crypto + wire-format core, plus (as of
+# ROADMAP.md m1) the Qt-free sender itself.
 #
-# the reusable part (`airplay_crypto`) builds standalone. the AP2 SENDER
-# (`src/raop_sender.*`) is reference source that still uses Qt networking +
-# host glue and is NOT wired here yet, see ROADMAP.md.
+# `airplay_crypto` builds standalone. `raop_sender` is the sender state
+# machine; it talks to the network only through `ITransport` (src/transport.h)
+# -- no Qt. `posix_transport` is the default (poll()/BSD sockets) adapter. A
+# CLI demo wiring these two together (`airplay-send <host> <file.wav>`) is
+# ROADMAP.md m3, not yet in this tree.
 cmake_minimum_required(VERSION 3.16)
 project(airplay2_sender LANGUAGES C CXX)
 
@@ -39,5 +42,16 @@ target_include_directories(airplay_crypto PUBLIC
 target_link_libraries(airplay_crypto PUBLIC mbedcrypto ed25519)
 target_compile_features(airplay_crypto PUBLIC cxx_std_20)
 
-# the sender + a CLI demo land here once the Qt-free transport interface from
-# ROADMAP.md is in. for now, read src/raop_sender.* alongside the README recipe.
+# --- the default Qt-free transport (poll()/BSD sockets); Linux/macOS/BSD ---
+add_library(posix_transport STATIC src/posix_transport.cpp)
+target_include_directories(posix_transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_features(posix_transport PUBLIC cxx_std_20)
+
+# --- the sender itself: plain C++ + ITransport + airplay_crypto, no Qt ---
+add_library(raop_sender STATIC src/raop_sender.cpp)
+target_include_directories(raop_sender PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(raop_sender PUBLIC airplay_crypto)
+target_compile_features(raop_sender PUBLIC cxx_std_20)
+
+# a CLI demo wiring raop_sender + posix_transport together lands at ROADMAP.md
+# m3; for now, read src/raop_sender.h alongside the README recipe.

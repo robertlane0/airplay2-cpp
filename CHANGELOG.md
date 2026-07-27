@@ -1,6 +1,19 @@
 # changelog
 
 ## unreleased
+- **ROADMAP.md m1: `raop_sender` is Qt-free.** Replaced `QTcpSocket` /
+  `QUdpSocket` / `QTimer` with `ITransport` (`src/transport.h`), a small
+  callback-driven network+timer interface; `QObject` signals became
+  `std::function` members; `QByteArray`/`QString`/`QHash`/`QList` became
+  `std::string`/`std::map`/`std::vector`. `PosixTransport`
+  (`src/posix_transport.{h,cpp}`) is the default adapter: plain `poll(2)` +
+  BSD sockets, IPv4-only, no third-party dependency. `RaopDeviceInfo::Auth`
+  (previously pulled from a host-only, not-in-this-repo `mdns_discovery.h`)
+  is folded in as `RaopSender::Auth`; `common/logger.h` is replaced by a
+  small pluggable `Log` sink (`src/logger.h`), both were m2 items, done
+  early since m1 needed them to build standalone at all. `raop_sender` and
+  `posix_transport` now build as CMake targets and have been run end-to-end
+  against a fake RTSP/RAOP receiver.
 - provenance made precise: the crypto/wire-format core is clean-room; the
   RAOP/AP2 transport in `raop_sender.cpp` is credited as a C++ port of pyatv
   (MIT). pyatv's MIT notice now ships in `licenses/THIRD-PARTY-NOTICES.txt`.
