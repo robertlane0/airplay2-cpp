@@ -18,11 +18,20 @@ include(FetchContent)
 # --- Mbed TLS 3.6 (Apache-2.0): bignum, sha512, hkdf, chachapoly, drbg ---
 set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
 set(ENABLE_TESTING  OFF CACHE BOOL "" FORCE)
+set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(mbedtls
     GIT_REPOSITORY https://github.com/Mbed-TLS/mbedtls.git
     GIT_TAG        v3.6.0
-    GIT_SHALLOW    TRUE)
+    GIT_SHALLOW    TRUE
+    SYSTEM
+)
 FetchContent_MakeAvailable(mbedtls)
+
+if(TARGET mbedcrypto)
+    target_compile_options(mbedcrypto PRIVATE
+        $<$<C_COMPILER_ID:GNU>:-Wno-unterminated-string-initialization>
+    )
+endif()
 
 # --- orlp/ed25519 (zlib, vendored): the one primitive Mbed TLS lacks ---
 # Drop seed.c and define ED25519_NO_SEED: ed25519_create_seed() is never called
