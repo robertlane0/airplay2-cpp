@@ -2,7 +2,7 @@
 
 prs and issues welcome. this is a small, focused project, the fastest way in is
 to read the README recipe + `ROADMAP.md`, then pick the thing that unblocks the
-most: **m1, the Qt-free transport interface.**
+most: **m3, the CLI demo** (m1, the Qt-free transport interface, is done).
 
 ## the one rule that actually matters: stay clean-room
 
@@ -28,6 +28,7 @@ first and ask.
 ## practical bits
 
 - build the crypto core: `cmake -B build && cmake --build build --target airplay_crypto`.
+- build the sender: `cmake --build build --target raop_sender posix_transport`.
 - keep the prose voice as-is (lowercase, plain). no em-dashes in comments/docs.
 - authorship: commits are by their author; no AI-attribution / `Co-Authored-By`
   trailers, please.
