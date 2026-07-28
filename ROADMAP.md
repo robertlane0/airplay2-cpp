@@ -16,16 +16,24 @@ Qt-free standalone library** you can `git clone && cmake && run`.
   through `ITransport` (`src/transport.h`); `PosixTransport`
   (`src/posix_transport.{h,cpp}`) is the default poll()/BSD-sockets adapter.
   `RaopDeviceInfo::Auth` is folded in as `RaopSender::Auth` and `common/logger.h`
-  is now the tiny pluggable `Log` sink m2 asked for (see below), so both m2 boxes
-  it depended on are already checked off; what's left of m2 is just mDNS. Builds
-  as a CMake target (`raop_sender`) and has been run end-to-end against a fake
-  RTSP/RAOP receiver (full OPTIONS → ANNOUNCE → SETUP → RECORD → streaming
-  handshake, correct packet sizes/marker bits), a real device is still the
-  better test, that's what m3's CLI demo is for.
+  is now the tiny pluggable `Log` sink m2 asked for. Builds as a CMake target
+  (`raop_sender`) and has been run end-to-end against a fake RTSP/RAOP receiver
+  (full OPTIONS → ANNOUNCE → SETUP → RECORD → streaming handshake, correct
+  packet sizes/marker bits), a real device is still the better test, that's
+  what m3's CLI demo is for.
+- **m2: the host glue is dropped.** `src/mdns_browser.{h,cpp}`: a small,
+  dependency-free mDNS/DNS-SD browser (RFC 6762/6763, hand-parsed, no
+  avahi/dns-sd/Bonjour.h) that finds `_airplay._tcp.local` /
+  `_raop._tcp.local` receivers and produces exactly what `RaopSender` needs,
+  host, port, a stable device id, and a starting `RaopSender::Auth` guess.
+  Builds as a CMake target (`mdns_browser`) and has been run against a
+  hand-crafted fake mDNS responder (PTR/SRV/TXT/A with real DNS name
+  compression, an `_airplay._tcp` + `_raop._tcp` upgrade-dedup case) and
+  ~5000 malformed/adversarial packets under ASan/UBSan with zero crashes.
 
 ## the path to standalone
 
-three milestones, in order. **m1 is done**; m2 is cleanup; m3 is the payoff.
+three milestones, in order. **m1 and m2 are done**; m3 is the payoff.
 
 ### m1: make the sender Qt-free (done)
 
@@ -65,24 +73,43 @@ RaopSender sender(io);
 while (running) io.poll(16);
 ```
 
-### m2: drop the host glue
+### m2: drop the host glue (done)
 
 - ~~`mdns_discovery.h` is only there for the `RaopDeviceInfo::Auth` enum~~, done
   as part of m1 (folded in as `RaopSender::Auth`, since the enum has nothing to
   do with discovery and the header didn't exist in this repo to begin with).
-  What's left: ship a tiny mDNS browser for receiver discovery (or let the
-  caller pass an already-resolved host + the `sf` flags, which `RaopSender`
-  already accepts today).
 - ~~`common/logger.h` becomes a one-line `std::function<void(level, msg)>`
   sink~~, done as part of m1 (`src/logger.h`), same shape this line asked for.
+- ~~ship a tiny mDNS browser for receiver discovery~~, done: `src/mdns_browser.h`.
+  a plain BSD-sockets multicast query + a bounds-checked DNS message parser
+  (no third-party mDNS/DNS-SD library), scoped to `_airplay._tcp.local` /
+  `_raop._tcp.local`:
+
+  ```cpp
+  MdnsBrowser browser;
+  browser.query([](const RaopDeviceInfo& d) {
+      // d.name, d.host, d.port, d.deviceId, d.airplay2, d.auth (a starting guess)
+  });
+  for (int i = 0; i < 20; ++i) browser.poll(100);   // ~2 s browse window
+  ```
+
+  the `RaopSender::Auth` it produces for an AirPlay-2 device is a documented
+  best-effort guess (`HapPin`), not a parsed feature-flag table, on purpose:
+  see `mdns_browser.cpp`'s `deriveAuth` for why, and why `RaopSender`'s own
+  403/470 auto-fallback between `HapPin`/`HapTransient` makes a wrong guess
+  cost one round trip, not a failure. resolves IPv4 only, and only from
+  records bundled in one response packet (every device this was tested
+  against does that); both are documented, narrow, deliberate scope cuts, not
+  gaps someone forgot.
 - `common/ring_buffer.h` is already self-contained (it lives in `src/`).
 
 ### m3: the demo
 
 `airplay-send <host> <file.wav>`: pair, set up, stream a wav, ctrl-c to stop. the
 thing you actually clone and run to prove it on your own couch in 30 seconds.
-`raop_sender` + `PosixTransport` are both ready for this now, it's wiring +
-a wav reader + an mDNS lookup (or a `--host` flag to skip discovery entirely).
+`raop_sender`, `PosixTransport`, and `mdns_browser` are all ready for this
+now, it's wiring + a wav reader (`--host` to skip discovery, or browse and
+pick the first `_airplay._tcp` device found).
 
 ## later / maybe
 
@@ -90,10 +117,13 @@ a wav reader + an mDNS lookup (or a `--host` flag to skip discovery entirely).
 - AAC / Opus on receivers that advertise it (realtime is hardcoded-ALAC).
 - multi-room / grouped output.
 - IPv6 in the default transport (the interface doesn't care; `PosixTransport`
-  currently only binds/sends IPv4).
+  currently only binds/sends IPv4) and in `mdns_browser` (A records only today).
+- a queued-query fallback in `mdns_browser` for a receiver that splits its
+  PTR/SRV/TXT/A answer across multiple response packets (none seen in testing
+  do this, but it's a real possibility per RFC 6762).
 
 ## want to help?
 
-**m3 is the one that matters now.** `raop_sender` and `PosixTransport` both
-build and run; the highest-leverage PR left is the CLI demo (or an mDNS browser
-for m2). open an issue and let's talk.
+**m3 is the one that matters now.** `raop_sender`, `PosixTransport`, and
+`mdns_browser` all build and run; the highest-leverage PR left is the CLI
+demo. open an issue and let's talk.

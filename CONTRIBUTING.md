@@ -2,7 +2,8 @@
 
 prs and issues welcome. this is a small, focused project, the fastest way in is
 to read the README recipe + `ROADMAP.md`, then pick the thing that unblocks the
-most: **m3, the CLI demo** (m1, the Qt-free transport interface, is done).
+most: **m3, the CLI demo** (m1, the Qt-free transport interface, and m2, mDNS
+discovery, are both done).
 
 ## the one rule that actually matters: stay clean-room
 
@@ -20,6 +21,13 @@ holds if we are careful about where code comes from:
   matching license + attribution with it. **never** copy from a GPL/AGPL source
   (owntone's daapd lineage, RAOP-Player, etc.), that would poison the
   Apache-2.0 license for everyone.
+- `src/mdns_browser.*` is a different case: it implements open IETF standards
+  (RFC 6762 mDNS, RFC 6763 DNS-SD), not a reverse-engineered Apple protocol, so
+  there's no clean-room concern for the wire-format parsing itself. The one
+  place Apple-specific guesswork creeps back in is `deriveAuth()` (mapping a
+  device's TXT record to a `RaopSender::Auth` starting guess); treat that
+  function with the same care as the crypto core, documentation only, no
+  pasted code, and be honest in comments about what's verified vs. guessed.
 
 when in doubt, describe the protocol behaviour in your own words and implement
 from that. if you're unsure whether something is OK to bring in, open an issue
@@ -29,6 +37,7 @@ first and ask.
 
 - build the crypto core: `cmake -B build && cmake --build build --target airplay_crypto`.
 - build the sender: `cmake --build build --target raop_sender posix_transport`.
+- build the mDNS browser: `cmake --build build --target mdns_browser`.
 - keep the prose voice as-is (lowercase, plain). no em-dashes in comments/docs.
 - authorship: commits are by their author; no AI-attribution / `Co-Authored-By`
   trailers, please.

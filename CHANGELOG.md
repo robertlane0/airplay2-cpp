@@ -1,6 +1,17 @@
 # changelog
 
 ## unreleased
+- **ROADMAP.md m2: the host glue is dropped.** Added `src/mdns_browser.{h,cpp}`:
+  a small, dependency-free mDNS/DNS-SD browser (RFC 6762/6763, hand-parsed, no
+  avahi/dns-sd/Bonjour.h) that discovers `_airplay._tcp.local` /
+  `_raop._tcp.local` receivers and resolves each to a `RaopDeviceInfo` (host,
+  port, deviceId, model, a starting `RaopSender::Auth` guess, and the raw TXT
+  record). Bounds-checked throughout (loop-safe DNS name decompression, no
+  trust placed in any length/count field from the wire), tested against a
+  hand-crafted fake mDNS responder (including multi-hop name-compression and
+  an `_airplay._tcp`/`_raop._tcp` upgrade-dedup case) and ~5000
+  malformed/adversarial packets under ASan/UBSan with zero crashes. Builds as
+  a CMake target (`mdns_browser`).
 - **ROADMAP.md m1: `raop_sender` is Qt-free.** Replaced `QTcpSocket` /
   `QUdpSocket` / `QTimer` with `ITransport` (`src/transport.h`), a small
   callback-driven network+timer interface; `QObject` signals became

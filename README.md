@@ -125,6 +125,7 @@ src/
   raop_sender.h   / .cpp    the AP2 sender state machine (the recipe, in code)
   transport.h               ITransport: the network+timer interface raop_sender talks to
   posix_transport.h / .cpp  the default ITransport adapter (poll()/BSD sockets)
+  mdns_browser.h  / .cpp    a tiny mDNS/DNS-SD browser for receiver discovery
   logger.h                  a tiny pluggable {}-placeholder log sink
   ring_buffer.h             the lock-free spsc tap the audio thread feeds
 third_party/ed25519/        the one primitive mbed tls lacks (zlib, vendored)
@@ -142,20 +143,29 @@ the encrypted control channel, the event channel, the ALAC realtime encoder,
 the keep-alive. **Qt-free**, it talks to the network only through
 `ITransport` (`transport.h`); `PosixTransport` is the default adapter.
 
+**`mdns_browser`** finds receivers on the LAN so you don't have to already
+know an IP: a small hand-rolled mDNS/DNS-SD client (no avahi, no dns-sd, no
+Bonjour SDK) that answers "what AirPlay/RAOP devices are out there, and what
+port/auth do I need to reach them."
+
 ## status (read me)
 
 this is **lifted, working, and verified** out of **FXChainPlayer**, where it
 casts to a real Apple TV 4K (`AppleTV14,1`) and a MacBook every day. as of
-**ROADMAP.md m1**, `raop_sender` is **Qt-free**: it talks to the network only
-through `ITransport`, with `PosixTransport` (plain `poll()` + BSD sockets) as
-the default adapter, no Qt, no host headers. it builds as a CMake target
-(`raop_sender`) and has been run end-to-end against a fake RTSP/RAOP receiver
+**ROADMAP.md m1 + m2**, `raop_sender` is **Qt-free** (talks to the network
+only through `ITransport`, `PosixTransport` as the default `poll()` + BSD-
+sockets adapter, no Qt, no host headers) and receiver discovery has no host
+glue either (`mdns_browser`, a small dependency-free mDNS client). all three
+build as CMake targets (`raop_sender`, `posix_transport`, `mdns_browser`) and
+have been run end-to-end: `raop_sender` against a fake RTSP/RAOP receiver
 (the full OPTIONS → ANNOUNCE → SETUP → RECORD → streaming handshake, correct
-packet framing throughout); a real device is still the better test, and a
-`airplay-send <host> <file.wav>` CLI demo to make that easy is **ROADMAP.md
-m3**, not yet in this tree. until then, wire `raop_sender` + `PosixTransport`
-up yourself (it's ~3 lines, see `ROADMAP.md`) or follow `raop_sender.{h,cpp}`
-as the recipe.
+packet framing throughout), `mdns_browser` against a fake mDNS responder plus
+~5000 malformed packets under ASan/UBSan. real devices are still the better
+test for both, and a `airplay-send <host> <file.wav>` CLI demo to make that
+easy is **ROADMAP.md m3**, not yet in this tree. until then, wire
+`raop_sender` + `PosixTransport` (+ `mdns_browser` for discovery) up yourself
+(see `ROADMAP.md` for the shape) or follow `raop_sender.{h,cpp}` as the
+recipe.
 
 if you want the polished player it lives in, here:
 
