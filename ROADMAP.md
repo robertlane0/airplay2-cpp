@@ -22,6 +22,13 @@ Qt-free standalone library** you can `git clone && cmake && run`.
   RTSP/RAOP receiver (full OPTIONS → ANNOUNCE → SETUP → RECORD → streaming
   handshake, correct packet sizes/marker bits), a real device is still the
   better test, that's what m3's CLI demo is for.
+- **m2: mDNS discovery added.** `src/mdns_discovery.{h,cpp}` provides cross-platform
+  RAOP/AirPlay receiver discovery via mDNS/DNS-SD. Linux/BSD uses avahi-client
+  (`libavahi-client-dev`), macOS uses DNSServiceBrowse (System framework). Ships
+  with both synchronous (`discover(timeoutMs)`) and asynchronous browsing APIs,
+  parses TXT records (`sf`, `am`, `did`, `model`, `mac`), and derives the auth
+  method automatically. The `RaopDiscovery::Auth` enum mirrors `RaopSender::Auth`
+  so callers can pass discovered devices directly to `setAuth()`.
 
 ## the path to standalone
 
@@ -65,14 +72,15 @@ RaopSender sender(io);
 while (running) io.poll(16);
 ```
 
-### m2: drop the host glue
+### m2: drop the host glue (done)
 
 - ~~`mdns_discovery.h` is only there for the `RaopDeviceInfo::Auth` enum~~, done
   as part of m1 (folded in as `RaopSender::Auth`, since the enum has nothing to
   do with discovery and the header didn't exist in this repo to begin with).
   What's left: ship a tiny mDNS browser for receiver discovery (or let the
   caller pass an already-resolved host + the `sf` flags, which `RaopSender`
-  already accepts today).
+  already accepts today). **Done:** `src/mdns_discovery.{h,cpp}` ships the mDNS
+  browser with both sync/async APIs.
 - ~~`common/logger.h` becomes a one-line `std::function<void(level, msg)>`
   sink~~, done as part of m1 (`src/logger.h`), same shape this line asked for.
 - `common/ring_buffer.h` is already self-contained (it lives in `src/`).

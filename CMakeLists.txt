@@ -62,5 +62,22 @@ target_include_directories(raop_sender PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(raop_sender PUBLIC airplay_crypto)
 target_compile_features(raop_sender PUBLIC cxx_std_20)
 
+# --- mDNS discovery for RAOP/AirPlay receivers (ROADMAP.md m2) ---
+# Linux/BSD: requires libavahi-client-dev
+# macOS: uses System.framework (dns_sd.h, built-in)
+add_library(mdns_discovery STATIC src/mdns_discovery.cpp)
+target_include_directories(mdns_discovery PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_features(mdns_discovery PUBLIC cxx_std_20)
+
+if(APPLE)
+    # macOS: dns_sd is in System framework
+    target_link_libraries(mdns_discovery PRIVATE "-framework System")
+elseif(UNIX)
+    # Linux/BSD: avahi-client
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(AVAHI REQUIRED IMPORTED_TARGET avahi-client)
+    target_link_libraries(mdns_discovery PRIVATE PkgConfig::AVAHI)
+endif()
+
 # a CLI demo wiring raop_sender + posix_transport together lands at ROADMAP.md
 # m3; for now, read src/raop_sender.h alongside the README recipe.

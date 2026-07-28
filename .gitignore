@@ -1,33 +1,45 @@
-# build
-/build/
-/_deps/
-CMakeCache.txt
-CMakeFiles/
-cmake_install.cmake
-compile_commands.json
-Makefile
+```
+# Build artifacts
 *.o
 *.obj
 *.a
 *.lib
 *.so
-*.dylib
+*.dll
 *.exe
-*.pdb
-*.ilk
-*.exp
-*.wav
-# ide
-.vs/
+*.out
+
+# CMake build directory
+build/
+cmake-build-*/
+
+# Dependencies
+venv/
+.venv/
+__pycache__/
+*.egg-info/
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
 .vscode/
 .idea/
-*.user
-# os
+*.swp
+*.swo
+*.tmp
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# OS
 .DS_Store
 Thumbs.db
-# never commit pairing material / keys captured while testing
-*.pem
-*.key
-*.p12
-pairing*.bin
-*.credentials
+```
