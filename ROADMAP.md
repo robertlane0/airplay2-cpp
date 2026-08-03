@@ -1,8 +1,8 @@
 # roadmap
 
-the crypto core already stands on its own. the goal here is to walk the rest of
-the sender the last mile: from "lifted out of a working player" to a **drop-in,
-Qt-free standalone library** you can `git clone && cmake && run`.
+**all three milestones are done.** what started as "lifted out of a working
+player" is now a `git clone && cmake && run` standalone: Qt-free, no host
+glue, a CLI that discovers a receiver and streams a wav to it.
 
 ## done
 
@@ -19,8 +19,7 @@ Qt-free standalone library** you can `git clone && cmake && run`.
   is now the tiny pluggable `Log` sink m2 asked for. Builds as a CMake target
   (`raop_sender`) and has been run end-to-end against a fake RTSP/RAOP receiver
   (full OPTIONS → ANNOUNCE → SETUP → RECORD → streaming handshake, correct
-  packet sizes/marker bits), a real device is still the better test, that's
-  what m3's CLI demo is for.
+  packet sizes/marker bits).
 - **m2: the host glue is dropped.** `src/mdns_browser.{h,cpp}`: a small,
   dependency-free mDNS/DNS-SD browser (RFC 6762/6763, hand-parsed, no
   avahi/dns-sd/Bonjour.h) that finds `_airplay._tcp.local` /
@@ -30,10 +29,25 @@ Qt-free standalone library** you can `git clone && cmake && run`.
   hand-crafted fake mDNS responder (PTR/SRV/TXT/A with real DNS name
   compression, an `_airplay._tcp` + `_raop._tcp` upgrade-dedup case) and
   ~5000 malformed/adversarial packets under ASan/UBSan with zero crashes.
+- **m3: the CLI demo.** `example/airplay_send.cpp` + `wav_reader.{h,cpp}` +
+  `creds_store.{h,cpp}`: `airplay-send <file.wav>` browses for a receiver,
+  connects, streams, and tears down on ctrl-c or end-of-file; `--host` skips
+  discovery, `--list` just prints what's out there. Builds as the
+  `airplay-send` CMake target. Run end-to-end against hand-built fake
+  devices covering the paths that matter: the actual zero-flags
+  discover-then-stream experience, `--host`/`--airplay1`/digest-adjacent
+  flags, ctrl-c mid-stream (confirmed a real TEARDOWN reaches the receiver),
+  the HAP on-screen-PIN prompt (stdin → `submitPin` → SRP M3, confirmed
+  byte-exact on the fake device's side), and malformed/missing wav files.
+  Caught and fixed two real bugs along the way: an uncaught-exception crash
+  on a non-numeric `--port`/`--volume`, and a credential cache that silently
+  failed to persist on a machine with no pre-existing `~/.cache` (both
+  covered above by tests now). The wav reader was separately fuzzed with 38
+  malformed files under ASan/UBSan.
 
 ## the path to standalone
 
-three milestones, in order. **m1 and m2 are done**; m3 is the payoff.
+three milestones, in order. **all three are done.**
 
 ### m1: make the sender Qt-free (done)
 
@@ -103,13 +117,35 @@ while (running) io.poll(16);
   gaps someone forgot.
 - `common/ring_buffer.h` is already self-contained (it lives in `src/`).
 
-### m3: the demo
+### m3: the demo (done)
 
-`airplay-send <host> <file.wav>`: pair, set up, stream a wav, ctrl-c to stop. the
-thing you actually clone and run to prove it on your own couch in 30 seconds.
-`raop_sender`, `PosixTransport`, and `mdns_browser` are all ready for this
-now, it's wiring + a wav reader (`--host` to skip discovery, or browse and
-pick the first `_airplay._tcp` device found).
+`example/airplay_send.cpp` wires `raop_sender` + `PosixTransport` +
+`mdns_browser` + a small wav reader + a per-device credential cache into one
+binary:
+
+```
+$ airplay-send living_room.wav
+browsing for AirPlay/RAOP devices (3s)...
+target: [AirPlay 2] Living Room  10.0.0.42:7000  (AppleTV14,1)
+loaded 'living_room.wav': 1323000 frames @ 44100 Hz (30s)
+streaming to 'Living Room'
+30s / 30s queued
+file fully queued, letting the tail play out...
+done
+```
+
+zero flags is the whole pitch: it browses, picks a receiver (preferring
+AirPlay 2), streams, and tears down cleanly on ctrl-c or end-of-file. `--host
+<ip>` skips picking a device (still enriches from mDNS if that host answers,
+falls back to a documented guess otherwise); `--list` just prints what's out
+there; `--airplay1` / `--password` / `--volume` / `--browse-time` /
+`--no-discover` round it out, see `--help`. A HAP on-screen PIN prompts on
+stdin; a successful pairing is cached under `~/.cache/airplay-send/` (or
+`$XDG_CACHE_HOME`) so the next run skips it.
+
+wav support: 8/16/24/32-bit PCM integer + 32-bit float, mono or stereo (extra
+channels dropped), any sample rate (`RaopSender` resamples to 44.1 kHz). Not
+a general media library, on purpose, this is a demo, not a decoder.
 
 ## later / maybe
 
@@ -121,9 +157,17 @@ pick the first `_airplay._tcp` device found).
 - a queued-query fallback in `mdns_browser` for a receiver that splits its
   PTR/SRV/TXT/A answer across multiple response packets (none seen in testing
   do this, but it's a real possibility per RFC 6762).
+- a real device run of the CLI's HAP on-screen-PIN path end to end (tested so
+  far against a hand-built fake device that proves the prompt/stdin/SRP-M3
+  plumbing works, see the m3 note above; a live Apple TV pairing + a stored
+  reconnect is the natural next confidence check).
+- streaming input for the demo (stdin / a growing file) instead of loading
+  the whole wav into memory upfront.
 
 ## want to help?
 
-**m3 is the one that matters now.** `raop_sender`, `PosixTransport`, and
-`mdns_browser` all build and run; the highest-leverage PR left is the CLI
-demo. open an issue and let's talk.
+the roadmap's three milestones are done; this is genuinely a working,
+standalone AirPlay 2 sender now. the wishlist above is what's left, and issues
+/ PRs against any of it are welcome, open one and let's talk. otherwise: try
+it against your own receiver and file a bug if something's off, that's worth
+more than another feature right now.

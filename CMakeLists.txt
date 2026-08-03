@@ -1,12 +1,12 @@
-# airplay 2 sender, build the Qt-free crypto + wire-format core, plus (as of
-# ROADMAP.md m1/m2) the Qt-free sender + receiver discovery.
+# airplay 2 sender, build the Qt-free crypto + wire-format core, the Qt-free
+# sender + receiver discovery, and (as of ROADMAP.md m3) the CLI demo.
 #
 # `airplay_crypto` builds standalone. `raop_sender` is the sender state
 # machine; it talks to the network only through `ITransport` (src/transport.h)
 # -- no Qt. `posix_transport` is the default (poll()/BSD sockets) adapter.
 # `mdns_browser` discovers receivers on the LAN (no Qt, no avahi/dns-sd/
-# Bonjour.h dependency). A CLI demo wiring these together
-# (`airplay-send <host> <file.wav>`) is ROADMAP.md m3, not yet in this tree.
+# Bonjour.h dependency). `airplay-send` (example/) wires all three together
+# into `airplay-send <host> <file.wav>`.
 cmake_minimum_required(VERSION 3.16)
 project(airplay2_sender LANGUAGES C CXX)
 
@@ -60,6 +60,11 @@ target_include_directories(mdns_browser PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(mdns_browser PUBLIC raop_sender)   # RaopSender::Auth
 target_compile_features(mdns_browser PUBLIC cxx_std_20)
 
-# a CLI demo wiring raop_sender + posix_transport + mdns_browser together
-# lands at ROADMAP.md m3; for now, read src/raop_sender.h alongside the
-# README recipe.
+# --- the CLI demo: raop_sender + posix_transport + mdns_browser + a wav
+# reader + a tiny per-device credential cache, wired into one binary ---
+add_executable(airplay-send
+    example/airplay_send.cpp
+    example/wav_reader.cpp
+    example/creds_store.cpp)
+target_link_libraries(airplay-send PRIVATE raop_sender posix_transport mdns_browser)
+target_compile_features(airplay-send PRIVATE cxx_std_20)

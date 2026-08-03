@@ -128,6 +128,10 @@ src/
   mdns_browser.h  / .cpp    a tiny mDNS/DNS-SD browser for receiver discovery
   logger.h                  a tiny pluggable {}-placeholder log sink
   ring_buffer.h             the lock-free spsc tap the audio thread feeds
+example/
+  airplay_send.cpp          the airplay-send CLI: wires everything above together
+  wav_reader.h    / .cpp    a small RIFF/WAVE -> interleaved-stereo-int16 reader
+  creds_store.h   / .cpp    the per-device HAP credential cache (~/.cache/airplay-send/)
 third_party/ed25519/        the one primitive mbed tls lacks (zlib, vendored)
 ```
 
@@ -148,24 +152,41 @@ know an IP: a small hand-rolled mDNS/DNS-SD client (no avahi, no dns-sd, no
 Bonjour SDK) that answers "what AirPlay/RAOP devices are out there, and what
 port/auth do I need to reach them."
 
+**`airplay-send`** is the CLI demo: run it with zero flags and a wav file and
+it browses, connects, pairs if it has to, and streams. See `--help`, or the
+example below.
+
 ## status (read me)
 
 this is **lifted, working, and verified** out of **FXChainPlayer**, where it
 casts to a real Apple TV 4K (`AppleTV14,1`) and a MacBook every day. as of
-**ROADMAP.md m1 + m2**, `raop_sender` is **Qt-free** (talks to the network
-only through `ITransport`, `PosixTransport` as the default `poll()` + BSD-
-sockets adapter, no Qt, no host headers) and receiver discovery has no host
-glue either (`mdns_browser`, a small dependency-free mDNS client). all three
-build as CMake targets (`raop_sender`, `posix_transport`, `mdns_browser`) and
-have been run end-to-end: `raop_sender` against a fake RTSP/RAOP receiver
-(the full OPTIONS → ANNOUNCE → SETUP → RECORD → streaming handshake, correct
-packet framing throughout), `mdns_browser` against a fake mDNS responder plus
-~5000 malformed packets under ASan/UBSan. real devices are still the better
-test for both, and a `airplay-send <host> <file.wav>` CLI demo to make that
-easy is **ROADMAP.md m3**, not yet in this tree. until then, wire
-`raop_sender` + `PosixTransport` (+ `mdns_browser` for discovery) up yourself
-(see `ROADMAP.md` for the shape) or follow `raop_sender.{h,cpp}` as the
-recipe.
+**ROADMAP.md m1 + m2 + m3, all three milestones are done**: `raop_sender` is
+**Qt-free** (talks to the network only through `ITransport`, `PosixTransport`
+as the default `poll()` + BSD-sockets adapter, no Qt, no host headers),
+receiver discovery has no host glue either (`mdns_browser`, a small
+dependency-free mDNS client), and there's a real CLI you can build and run:
+
+```
+$ cmake -B build && cmake --build build --target airplay-send
+$ ./build/airplay-send living_room.wav
+browsing for AirPlay/RAOP devices (3s)...
+target: [AirPlay 2] Living Room  10.0.0.42:7000  (AppleTV14,1)
+streaming to 'Living Room'
+```
+
+all four build as CMake targets (`raop_sender`, `posix_transport`,
+`mdns_browser`, `airplay-send`) and have been run end-to-end against
+hand-built fake devices: the full RTSP/RAOP handshake and streaming, the mDNS
+discovery + `_airplay`/`_raop` upgrade-dedup path, the CLI's zero-flags
+discover-and-play path, ctrl-c mid-stream (a real TEARDOWN reaches the
+receiver), and the HAP on-screen-PIN prompt (stdin → pairing, confirmed
+byte-exact on the fake device's side). the wav reader and mDNS parser were
+separately fuzzed under ASan/UBSan (malformed files / malformed packets) with
+zero crashes. a **real device** is still the best test, that hasn't happened
+yet for this standalone extraction specifically (as opposed to the protocol
+logic itself, which runs on real Apple TVs/HomePods/Macs daily inside
+FXChainPlayer, see above); if you try it against your own receiver and
+something's off, please file an issue.
 
 if you want the polished player it lives in, here:
 

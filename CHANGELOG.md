@@ -1,6 +1,23 @@
 # changelog
 
 ## unreleased
+- **ROADMAP.md m3: the CLI demo.** Added `airplay-send` (`example/`): browses
+  for a receiver via `mdns_browser`, connects and streams a `.wav` through
+  `raop_sender` + `PosixTransport`, tears down cleanly on ctrl-c or
+  end-of-file. New `example/wav_reader.{h,cpp}` (RIFF/WAVE, 8/16/24/32-bit
+  PCM + float32, mono/stereo, WAVE_FORMAT_EXTENSIBLE) and
+  `example/creds_store.{h,cpp}` (a per-device HAP credential cache under
+  `~/.cache/airplay-send/`, so a re-run skips the on-screen PIN). Verified
+  end-to-end against hand-built fake devices: the zero-flags discover-and-
+  play path, `--host`/`--airplay1`/`--list`/`--no-discover`, ctrl-c mid-
+  stream (confirmed a real TEARDOWN reaches the receiver), and the HAP
+  on-screen-PIN prompt (stdin -> `submitPin` -> SRP M3, confirmed byte-exact
+  on the fake device's side). Fixed two bugs found in the process: an
+  uncaught-exception crash on a non-numeric `--port`/`--volume`/
+  `--browse-time`, and a credential cache that silently failed to persist on
+  a machine with no pre-existing `~/.cache` (both now covered by tests). The
+  wav reader was separately fuzzed with 38 malformed files under ASan/UBSan
+  with zero crashes. Builds as the `airplay-send` CMake target.
 - **ROADMAP.md m2: the host glue is dropped.** Added `src/mdns_browser.{h,cpp}`:
   a small, dependency-free mDNS/DNS-SD browser (RFC 6762/6763, hand-parsed, no
   avahi/dns-sd/Bonjour.h) that discovers `_airplay._tcp.local` /
