@@ -1,0 +1,35 @@
+# build
+/build/
+/_deps/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+Makefile
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.wav
+airplay-send
+# ide
+.vs/
+.vscode/
+.idea/
+*.user
+# os
+.DS_Store
+Thumbs.db
+# never commit pairing material / keys captured while testing
+*.pem
+*.key
+*.p12
+pairing*.bin
+*.credentials
+
