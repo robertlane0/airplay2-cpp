@@ -77,3 +77,34 @@ add_executable(airplay-send
     example/creds_store.cpp)
 target_link_libraries(airplay-send PRIVATE raop_sender posix_transport mdns_browser)
 target_compile_features(airplay-send PRIVATE cxx_std_20)
+
+# --- optional: miniaudio (decoding-only) for mp3/flac/ogg/opus support ---
+# Default OFF: the default build stays wav-only and dependency-free.
+# When ON: tries the fuzz-tested wav_reader first, miniaudio fallback.
+option(ENABLE_MINIAUDIO "Build with miniaudio for mp3/flac/ogg/opus decoding" OFF)
+if(ENABLE_MINIAUDIO)
+    # Suppress miniaudio's own examples/tests; strip the device/record/
+    # encoding/generation subsystems so it needs no platform audio libs.
+    set(MINIAUDIO_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(MINIAUDIO_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
+    set(MINIAUDIO_EXTRAS        OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(miniaudio
+        GIT_REPOSITORY https://github.com/mackron/miniaudio.git
+        GIT_TAG        0.11.25
+        GIT_SHALLOW    TRUE
+        SYSTEM
+    )
+    FetchContent_MakeAvailable(miniaudio)
+
+    # Decoding-only: strip everything the demo doesn't need.
+    target_compile_definitions(miniaudio PUBLIC
+        MA_NO_DEVICE_IO
+        MA_NO_ENCODING
+        MA_NO_GENERATION
+    )
+
+    target_sources(airplay-send PRIVATE example/miniaudio_reader.cpp)
+    target_link_libraries(airplay-send PRIVATE miniaudio)
+    target_compile_definitions(airplay-send PRIVATE WITH_MINIAUDIO)
+endif()
+

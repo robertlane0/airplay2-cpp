@@ -21,6 +21,9 @@
 #include "raop_sender.h"
 #include "ring_buffer.h"
 #include "wav_reader.h"
+#ifdef WITH_MINIAUDIO
+#include "miniaudio_reader.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -100,11 +103,18 @@ struct Options {
 };
 
 void printUsage(const char* argv0) {
+#ifdef WITH_MINIAUDIO
+    const char* fileArg = "<file>";
+    const char* fileDesc = "stream an audio file (wav/mp3/flac/ogg/opus) to an AirPlay / RAOP receiver.";
+#else
+    const char* fileArg = "<file.wav>";
+    const char* fileDesc = "stream a .wav file to an AirPlay / RAOP receiver.";
+#endif
     std::cout <<
-        "usage: " << argv0 << " [options] <file.wav>\n"
+        "usage: " << argv0 << " [options] " << fileArg << "\n"
         "       " << argv0 << " --list\n"
         "\n"
-        "stream a .wav file to an AirPlay / RAOP receiver.\n"
+        << fileDesc << "\n"
         "\n"
         "options:\n"
         "  --host <ip>          connect directly to this IP; skips picking a\n"
@@ -275,6 +285,9 @@ int main(int argc, char** argv) {
     std::cout << "target: "; printDevice(device);
 
     AudioData audio = loadWavAsStereo16(o.wavPath);
+#ifdef WITH_MINIAUDIO
+    if (!audio.ok) audio = loadWithMiniAudio(o.wavPath);
+#endif
     if (!audio.ok) {
         std::cerr << "error: " << audio.error << "\n";
         return 1;
