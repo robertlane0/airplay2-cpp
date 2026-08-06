@@ -96,6 +96,20 @@ if(ENABLE_MINIAUDIO)
     )
     FetchContent_MakeAvailable(miniaudio)
 
+    file(WRITE "${CMAKE_BINARY_DIR}/miniaudio_impl.c"
+        "#define STB_VORBIS_HEADER_ONLY\n"
+        "#include \"extras/stb_vorbis.c\"\n"
+        "#define MINIAUDIO_IMPLEMENTATION\n"
+        "#define MA_NO_DEVICE_IO\n"
+        "#define MA_NO_ENCODING\n"
+        "#define MA_NO_GENERATION\n"
+        "#include \"miniaudio.h\"\n"
+        "#undef STB_VORBIS_HEADER_ONLY\n"
+        "#include \"extras/stb_vorbis.c\"\n"
+    )
+    set_target_properties(miniaudio PROPERTIES SOURCES "${CMAKE_BINARY_DIR}/miniaudio_impl.c")
+    target_include_directories(miniaudio PRIVATE "${miniaudio_SOURCE_DIR}")
+
     # Decoding-only: strip everything the demo doesn't need.
     target_compile_definitions(miniaudio PUBLIC
         MA_NO_DEVICE_IO

@@ -2,7 +2,6 @@
 //
 // miniaudio_reader.cpp -- see miniaudio_reader.h for scope notes.
 //
-// This file includes miniaudio.h for declarations only; the implementation
 // (MINIAUDIO_IMPLEMENTATION) is compiled in its own TU via CMake's generated
 // miniaudio_impl.c, so there's no double-implementation risk here.
 
@@ -16,6 +15,7 @@ namespace {
 // Mirror the ~1 GB cap from wav_reader.cpp; at stereo s16 (4 bytes/frame)
 // this is 268 M frames, generous headroom for anything reasonable.
 constexpr size_t kMaxFrames = 1024ULL * 1024 * 1024 / 4;
+constexpr size_t kChunkFrames = 4096;
 
 } // namespace
 
@@ -31,34 +31,66 @@ AudioData loadWithMiniAudio(const std::string& path) {
         return out;
     }
 
-    ma_uint64 total = 0;
-    if (ma_decoder_get_length_in_pcm_frames(&d, &total) != MA_SUCCESS || total == 0) {
-        out.error = (total == 0) ? "file contains no audio"
-                                 : "could not determine audio length";
-        ma_decoder_uninit(&d);
-        return out;
-    }
-    if (total > kMaxFrames) {
-        out.error = "file is implausibly large, refusing to load";
-        ma_decoder_uninit(&d);
-        return out;
-    }
-
     out.sampleRate = d.outputSampleRate;    // native; RaopSender resamples
-    out.pcm.resize(size_t(total) * 2);      // s16 stereo == 2 samples/frame
 
-    ma_uint64 framesRead = 0;
-    ma_result result = ma_decoder_read_pcm_frames(&d, out.pcm.data(), total, &framesRead);
-    if (result != MA_SUCCESS && result != MA_AT_END) {
-        out.error = "decode failed partway through the file";
+    ma_uint64 total = 0;
+    ma_result lenResult = ma_decoder_get_length_in_pcm_frames(&d, &total);
+
+    if (lenResult == MA_SUCCESS && total > 0) {
+        if (total > kMaxFrames) {
+            out.error = "file is implausibly large, refusing to load";
+            ma_decoder_uninit(&d);
+            return out;
+        }
+
+        out.pcm.resize(size_t(total) * 2);      // s16 stereo == 2 samples/frame
+
+        ma_uint64 framesRead = 0;
+        ma_result result = ma_decoder_read_pcm_frames(&d, out.pcm.data(), total, &framesRead);
+        if (result != MA_SUCCESS && result != MA_AT_END) {
+            out.error = "decode failed partway through the file";
+            ma_decoder_uninit(&d);
+            return out;
+        }
+
+        // If the decoder returned fewer frames than advertised (can happen with
+        // some VBR formats), shrink the buffer to match what was actually read.
+        if (framesRead < total)
+            out.pcm.resize(size_t(framesRead) * 2);
+    } else {
+        // Fallback for decoders (e.g. stb_vorbis / push-mode decoders) where length
+        // is unknown or returns 0. Read in chunks until EOF.
+        while (true) {
+            const size_t currentFrames = out.pcm.size() / 2;
+            if (currentFrames + kChunkFrames > kMaxFrames) {
+                out.error = "file is implausibly large, refusing to load";
+                ma_decoder_uninit(&d);
+                return out;
+            }
+            out.pcm.resize((currentFrames + kChunkFrames) * 2);
+
+            ma_uint64 framesReadThisChunk = 0;
+            ma_result res = ma_decoder_read_pcm_frames(&d, out.pcm.data() + currentFrames * 2, kChunkFrames, &framesReadThisChunk);
+            
+            const size_t newFrames = currentFrames + size_t(framesReadThisChunk);
+            out.pcm.resize(newFrames * 2);
+
+            if (res == MA_AT_END || framesReadThisChunk == 0) {
+                break;
+            }
+            if (res != MA_SUCCESS) {
+                out.error = "decode failed partway through the file";
+                ma_decoder_uninit(&d);
+                return out;
+            }
+        }
+    }
+
+    if (out.pcm.empty()) {
+        out.error = "file contains no audio";
         ma_decoder_uninit(&d);
         return out;
     }
-
-    // If the decoder returned fewer frames than advertised (can happen with
-    // some VBR formats), shrink the buffer to match what was actually read.
-    if (framesRead < total)
-        out.pcm.resize(size_t(framesRead) * 2);
 
     ma_decoder_uninit(&d);
     out.ok = true;
