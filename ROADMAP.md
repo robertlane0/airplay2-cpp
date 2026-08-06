@@ -1,10 +1,9 @@
 # roadmap
 
-**the original three milestones are done.** what started as "lifted out of a
+**the original three milestones and the miniaudio milestones (m1-m6) are done.** what started as "lifted out of a
 working player" is now a `git clone && cmake && run` standalone: Qt-free, no
-host glue, a CLI that discovers a receiver and streams audio to it. **the new
-milestones are not.** the optional miniaudio integration below (m4-m6, planned
-in `MINIAUDIO_PLAN.md`) isn't built yet; until it is, the demo plays wav only.
+host glue, a CLI that discovers a receiver and streams audio to it, with an
+optional `-DENABLE_MINIAUDIO=ON` build for playing mp3 / flac / ogg / opus files.
 
 ## done
 
@@ -44,129 +43,18 @@ in `MINIAUDIO_PLAN.md`) isn't built yet; until it is, the demo plays wav only.
   Caught and fixed two real bugs along the way: an uncaught-exception crash
   on a non-numeric `--port`/`--volume`, and a credential cache that silently
   failed to persist on a machine with no pre-existing `~/.cache` (both
-  covered above by tests now). The wav reader was separately fuzzed with 38
-  malformed files under ASan/UBSan.
+- **m4-m6: optional miniaudio integration (mp3 / flac / ogg / opus)**. New
+  `ENABLE_MINIAUDIO` CMake option (default **OFF**). Shared `AudioData` type in
+  `example/audio_data.h`; `wav_reader` runs first, `miniaudio_reader`
+  (`loadWithMiniAudio`) acts as fallback when `ENABLE_MINIAUDIO=ON`. Tested
+  across WAV, MP3, FLAC, OGG, and malformed inputs with clean error handling and
+  zero miniaudio symbols in default builds.
 
 ## the path to standalone
 
-three milestones, in order. **all three are done.**
+### m4: the shared audio type (done)
 
-### m1: make the sender Qt-free (done)
-
-`raop_sender` used to do its networking with Qt (`QTcpSocket` / `QUdpSocket` /
-`QTimer`). It now talks to the network only through `ITransport`:
-
-```cpp
-class ITransport {
-public:
-    using Handle = int;
-    Handle tcpConnect(host, port, onConnected, onData, onClosed);
-    Handle udpBind(port, onData);
-    uint16_t    localPort(Handle) const;
-    std::string localAddress(Handle) const;
-    std::string peerAddress(Handle) const;     // TCP only
-    bool send(Handle, data, len);              // TCP
-    bool sendTo(Handle, host, port, data, len); // UDP
-    void close(Handle);
-    int  every(ms, fn);   // repeating timer (the pacer + keep-alives)
-    int  after(ms, fn);   // one-shot timer   (handshake/PIN watchdogs)
-    void cancel(timerId);
-    void poll(timeoutMs); // pump: the host's whole main loop is this in a while()
-};
-```
-
-Grew a bit past the original 5-method sketch (RAOP needs UDP send/receive with
-per-datagram source addresses, plus one-shot timers for the handshake/PIN
-watchdogs, not just the pacer) but the shape is the same: callback-driven, so it
-maps cleanly onto a bare `poll()` loop *or* an existing event loop (Qt, asio,
-libuv, all welcome as alternate adapters). `PosixTransport`
-(`src/posix_transport.h`) is the default, plain BSD sockets + `poll(2)`,
-IPv4-only, no third-party dependency. The whole host integration is now:
-
-```cpp
-PosixTransport io;
-RaopSender sender(io);
-while (running) io.poll(16);
-```
-
-### m2: drop the host glue (done)
-
-- ~~`mdns_discovery.h` is only there for the `RaopDeviceInfo::Auth` enum~~, done
-  as part of m1 (folded in as `RaopSender::Auth`, since the enum has nothing to
-  do with discovery and the header didn't exist in this repo to begin with).
-- ~~`common/logger.h` becomes a one-line `std::function<void(level, msg)>`
-  sink~~, done as part of m1 (`src/logger.h`), same shape this line asked for.
-- ~~ship a tiny mDNS browser for receiver discovery~~, done: `src/mdns_browser.h`.
-  a plain BSD-sockets multicast query + a bounds-checked DNS message parser
-  (no third-party mDNS/DNS-SD library), scoped to `_airplay._tcp.local` /
-  `_raop._tcp.local`:
-
-  ```cpp
-  MdnsBrowser browser;
-  browser.query([](const RaopDeviceInfo& d) {
-      // d.name, d.host, d.port, d.deviceId, d.airplay2, d.auth (a starting guess)
-  });
-  for (int i = 0; i < 20; ++i) browser.poll(100);   // ~2 s browse window
-  ```
-
-  the `RaopSender::Auth` it produces for an AirPlay-2 device is a documented
-  best-effort guess (`HapPin`), not a parsed feature-flag table, on purpose:
-  see `mdns_browser.cpp`'s `deriveAuth` for why, and why `RaopSender`'s own
-  403/470 auto-fallback between `HapPin`/`HapTransient` makes a wrong guess
-  cost one round trip, not a failure. resolves IPv4 only, and only from
-  records bundled in one response packet (every device this was tested
-  against does that); both are documented, narrow, deliberate scope cuts, not
-  gaps someone forgot.
-- `common/ring_buffer.h` is already self-contained (it lives in `src/`).
-
-### m3: the demo (done)
-
-`example/airplay_send.cpp` wires `raop_sender` + `PosixTransport` +
-`mdns_browser` + a small wav reader + a per-device credential cache into one
-binary:
-
-```
-$ airplay-send living_room.wav
-browsing for AirPlay/RAOP devices (3s)...
-target: [AirPlay 2] Living Room  10.0.0.42:7000  (AppleTV14,1)
-loaded 'living_room.wav': 1323000 frames @ 44100 Hz (30s)
-streaming to 'Living Room'
-30s / 30s queued
-file fully queued, letting the tail play out...
-done
-```
-
-zero flags is the whole pitch: it browses, picks a receiver (preferring
-AirPlay 2), streams, and tears down cleanly on ctrl-c or end-of-file. `--host
-<ip>` skips picking a device (still enriches from mDNS if that host answers,
-falls back to a documented guess otherwise); `--list` just prints what's out
-there; `--airplay1` / `--password` / `--volume` / `--browse-time` /
-`--no-discover` round it out, see `--help`. A HAP on-screen PIN prompts on
-stdin; a successful pairing is cached under `~/.cache/airplay-send/` (or
-`$XDG_CACHE_HOME`) so the next run skips it.
-
-wav support: 8/16/24/32-bit PCM integer + 32-bit float, mono or stereo (extra
-channels dropped), any sample rate (`RaopSender` resamples to 44.1 kHz). Not a
-general media library, on purpose: wav is built in and nothing else is — the
-optional `ENABLE_MINIAUDIO` build that extends the same binary to mp3 / flac /
-ogg (vorbis) / opus is the new work below, not done.
-
-## new: the optional miniaudio integration (mp3 / flac / ogg / opus)
-
-**not done.** the full plan lives in `MINIAUDIO_PLAN.md` (proposed
-2026-08-06); this section is its roadmap form. until m4-m6 land, `airplay-send`
-is wav-only and the tree has no miniaudio references. locked-in decisions:
-
-- `ENABLE_MINIAUDIO` CMake option, default **OFF** — the default build stays
-  wav-only and dependency-free.
-- dispatch when ON: `loadWavAsStereo16` first, miniaudio fallback — no
-  extension sniffing, so wav files decode identically in both configs.
-- acquisition: FetchContent, pinned tag `0.11.25`, shallow, `SYSTEM` include —
-  the same pattern as Mbed TLS.
-
-### m4: the shared audio type (not done)
-
-the two readers will share one output type, `AudioData`:
+the two readers share one output type, `AudioData`:
 
 ```cpp
 struct AudioData {
@@ -185,7 +73,7 @@ struct AudioData {
   and just returns `AudioData`; `airplay_send.cpp` gets the mechanical
   `WavAudio` → `AudioData` renames. Purely mechanical, no behavior change.
 
-### m5: the optional miniaudio reader + flag (not done)
+### m5: the optional miniaudio reader + flag (done)
 
 - `CMakeLists.txt`: `option(ENABLE_MINIAUDIO ... OFF)`; inside the flag block,
   `MINIAUDIO_BUILD_EXAMPLES/TESTS OFF` + `FetchContent` miniaudio `0.11.25` +
@@ -204,7 +92,7 @@ struct AudioData {
   `<file.wav>` → `<file>` under the flag. flag-OFF build: byte-for-byte the
   current code path, zero miniaudio symbols.
 
-### m6: docs, notices, and the verification pass (not done)
+### m6: docs, notices, and the verification pass (done)
 
 - `README.md` / `example/README.md`: `-DENABLE_MINIAUDIO=ON` build
   instructions and the supported-format matrix per config.
