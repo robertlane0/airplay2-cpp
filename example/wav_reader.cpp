@@ -107,14 +107,21 @@ WavAudio loadWavAsStereo16(const std::string& path) {
             sampleRate    = rdU32(p + 4);
             blockAlign    = rdU16(p + 12);
             bitsPerSample = rdU16(p + 14);
-            // WAVE_FORMAT_EXTENSIBLE (0xFFFE): the real format lives in the
-            // first 2 bytes of the 16-byte SubFormat GUID, after a 2-byte
-            // cbSize + 2-byte validBitsPerSample + 4-byte channelMask.
-            if (formatTag == 0xFFFE && chunkSize >= 18 + 16) {
-                const uint8_t* ext = p + 18;   // cbSize(2) validBits(2) mask(4) = 8, then SubFormat GUID(16)
-                if (chunkSize >= 16 + 8 + 16)
-                    formatTag = rdU16(ext + 8);
-            }
+            // WAVE_FORMAT_EXTENSIBLE (0xFFFE): the base WAVEFORMATEX fields
+            // (formatTag..bitsPerSample) are the first 16 bytes, followed by
+            // cbSize(2) + wValidBitsPerSample(2) + dwChannelMask(4), and only
+            // THEN the 16-byte SubFormat GUID, whose first 2 bytes are the
+            // real format tag. 16 + 2 + 2 + 4 = byte offset 24.
+            //
+            // (An earlier version of this function read the GUID 2 bytes too
+            // far in -- it split the "+8" into ext=p+18 then ext+8, which
+            // silently re-counted cbSize a second time. That decoded PCM's
+            // GUID as formatTag 0 instead of 1, so a real-world 24-bit
+            // WAVE_FORMAT_EXTENSIBLE wav, the kind Bandcamp/most DAWs export
+            // above 16-bit, got rejected as "unsupported format tag 0" even
+            // though it's plain PCM. Fixed and covered by a regression test.)
+            if (formatTag == 0xFFFE && chunkSize >= 24 + 16)
+                formatTag = rdU16(p + 24);
             haveFmt = true;
         } else if (std::memcmp(chunkId, "data", 4) == 0) {
             dataPtr = buf.data() + chunkDataOff;
