@@ -14,20 +14,9 @@
 // file, not untrusted network input, but "corrupt wav -> clear error" beats
 // "corrupt wav -> crash" for a CLI tool either way).
 
-#include <cstdint>
-#include <string>
-#include <vector>
+#include "audio_data.h"
 
 namespace fxchain {
-
-struct WavAudio {
-    std::vector<int16_t> pcm;   // interleaved stereo (frame = pcm[i*2], pcm[i*2+1])
-    uint32_t sampleRate = 0;
-    bool ok = false;
-    std::string error;          // set when ok == false
-
-    size_t frames() const { return pcm.size() / 2; }
-};
 
 // Reads `path`, converts to interleaved stereo 16-bit PCM at the file's
 // native sample rate (RaopSender resamples to 44.1 kHz internally, see
@@ -35,6 +24,6 @@ struct WavAudio {
 // duplicated to both channels; more than 2 channels keeps only the first 2.
 // Supports 8/16/24/32-bit integer PCM and 32-bit IEEE float, including a
 // WAVE_FORMAT_EXTENSIBLE fmt chunk.
-WavAudio loadWavAsStereo16(const std::string& path);
+AudioData loadWavAsStereo16(const std::string& path);
 
 } // namespace fxchain

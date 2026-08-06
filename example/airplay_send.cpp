@@ -274,13 +274,13 @@ int main(int argc, char** argv) {
     const RaopDeviceInfo device = *deviceOpt;
     std::cout << "target: "; printDevice(device);
 
-    WavAudio wav = loadWavAsStereo16(o.wavPath);
-    if (!wav.ok) {
-        std::cerr << "error: " << wav.error << "\n";
+    AudioData audio = loadWavAsStereo16(o.wavPath);
+    if (!audio.ok) {
+        std::cerr << "error: " << audio.error << "\n";
         return 1;
     }
-    std::cout << "loaded '" << o.wavPath << "': " << wav.frames() << " frames @ "
-              << wav.sampleRate << " Hz (" << (double(wav.frames()) / double(wav.sampleRate)) << "s)\n";
+    std::cout << "loaded '" << o.wavPath << "': " << audio.frames() << " frames @ "
+              << audio.sampleRate << " Hz (" << (double(audio.frames()) / double(audio.sampleRate)) << "s)\n";
 
     const std::string cachedCreds = loadCachedCreds(device.deviceId);
     if (!cachedCreds.empty())
@@ -292,9 +292,9 @@ int main(int argc, char** argv) {
     // Roughly a second of stereo audio at the file's native rate; plenty of
     // headroom for the ~8 ms pacer to pull from without the feed loop below
     // needing to be especially tight about topping it up.
-    RingBuffer<int16_t> ring(size_t(std::max<uint32_t>(wav.sampleRate, 8000)) * 2);
+    RingBuffer<int16_t> ring(size_t(std::max<uint32_t>(audio.sampleRate, 8000)) * 2);
     sender.attachRing(&ring);
-    sender.setInputFormat(wav.sampleRate);
+    sender.setInputFormat(audio.sampleRate);
 
     bool launchDone = false, launchedOk = false, sessionClosed = false;
 
@@ -331,7 +331,7 @@ int main(int argc, char** argv) {
     sender.start(device.host, device.port, device.name);
 
     size_t offset = 0;
-    const size_t totalSamples = wav.pcm.size();
+    const size_t totalSamples = audio.pcm.size();
     bool fileQueued = false, draining = false;
     std::chrono::steady_clock::time_point drainDeadline{};
     auto lastProgress = std::chrono::steady_clock::now();
@@ -343,7 +343,7 @@ int main(int argc, char** argv) {
             size_t chunk = std::min(avail, totalSamples - offset);
             chunk -= chunk % 2;   // keep stereo-frame alignment
             if (chunk == 0) break;
-            if (!ring.tryPush(std::span<const int16_t>(wav.pcm.data() + offset, chunk))) break;
+            if (!ring.tryPush(std::span<const int16_t>(audio.pcm.data() + offset, chunk))) break;
             offset += chunk;
         }
         if (offset >= totalSamples) fileQueued = true;
@@ -353,8 +353,8 @@ int main(int argc, char** argv) {
         const auto now = std::chrono::steady_clock::now();
         if (launchDone && launchedOk && now - lastProgress >= std::chrono::milliseconds(1000)) {
             lastProgress = now;
-            const double queuedSec = double(offset / 2) / double(wav.sampleRate);
-            const double totalSec  = double(totalSamples / 2) / double(wav.sampleRate);
+            const double queuedSec = double(offset / 2) / double(audio.sampleRate);
+            const double totalSec  = double(totalSamples / 2) / double(audio.sampleRate);
             std::cout << "\r" << queuedSec << "s / " << totalSec << "s queued   " << std::flush;
         }
 

@@ -60,8 +60,8 @@ int16_t decodeSample(const uint8_t* p, int bytesPerSample, uint16_t formatTag) {
 
 }  // namespace
 
-WavAudio loadWavAsStereo16(const std::string& path) {
-    WavAudio out;
+AudioData loadWavAsStereo16(const std::string& path) {
+    AudioData out;
 
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) { out.error = "could not open '" + path + "'"; return out; }
