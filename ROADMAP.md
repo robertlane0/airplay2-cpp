@@ -1,10 +1,10 @@
 # roadmap
 
-**all three milestones are done, and so is the optional miniaudio flag.** what
-started as "lifted out of a working player" is now a `git clone && cmake &&
-run` standalone: Qt-free, no host glue, a CLI that discovers a receiver and
-streams audio to it (wav out of the box, mp3/flac/ogg/opus with
-`-DENABLE_MINIAUDIO=ON`).
+**the original three milestones are done.** what started as "lifted out of a
+working player" is now a `git clone && cmake && run` standalone: Qt-free, no
+host glue, a CLI that discovers a receiver and streams audio to it. **the new
+milestones are not.** the optional miniaudio integration below (m4-m6, planned
+in `MINIAUDIO_PLAN.md`) isn't built yet; until it is, the demo plays wav only.
 
 ## done
 
@@ -46,19 +46,6 @@ streams audio to it (wav out of the box, mp3/flac/ogg/opus with
   failed to persist on a machine with no pre-existing `~/.cache` (both
   covered above by tests now). The wav reader was separately fuzzed with 38
   malformed files under ASan/UBSan.
-- **miniaudio, optional: the demo plays more than wav.** New `ENABLE_MINIAUDIO`
-  CMake option (default **OFF**; see `MINIAUDIO_PLAN.md` for the full plan): the
-  flag build fetches miniaudio 0.11.25 (FetchContent, pinned tag, decode-only
-  defines) and compiles `example/miniaudio_reader.{h,cpp}`
-  (`loadWithMiniAudio`), so `airplay-send` decodes **mp3 / flac / ogg (vorbis) /
-  opus** in addition to wav. Dispatch is fallback-based: the fuzz-tested
-  `loadWavAsStereo16` always runs first and miniaudio is only asked when it
-  fails, so the default build is byte-for-byte the wav-only code path and
-  wav files decode identically in both configs. The two readers share one
-  output type, `AudioData` (new `example/audio_data.h`; the old `WavAudio`
-  struct moved there and was renamed). aac is a documented non-goal, miniaudio's
-  built-in decoders don't cover it. Whole-file decode, same as the wav reader;
-  streaming decode is the natural follow-up, noted below.
 
 ## the path to standalone
 
@@ -160,17 +147,85 @@ stdin; a successful pairing is cached under `~/.cache/airplay-send/` (or
 
 wav support: 8/16/24/32-bit PCM integer + 32-bit float, mono or stereo (extra
 channels dropped), any sample rate (`RaopSender` resamples to 44.1 kHz). Not a
-general media library, on purpose: wav is built in and nothing else is. the
-optional `ENABLE_MINIAUDIO=ON` build (see the done list above) extends the same
-binary to mp3 / flac / ogg (vorbis) / opus via a miniaudio fallback reader,
-without growing the core the demo wires together.
+general media library, on purpose: wav is built in and nothing else is — the
+optional `ENABLE_MINIAUDIO` build that extends the same binary to mp3 / flac /
+ogg (vorbis) / opus is the new work below, not done.
+
+## new: the optional miniaudio integration (mp3 / flac / ogg / opus)
+
+**not done.** the full plan lives in `MINIAUDIO_PLAN.md` (proposed
+2026-08-06); this section is its roadmap form. until m4-m6 land, `airplay-send`
+is wav-only and the tree has no miniaudio references. locked-in decisions:
+
+- `ENABLE_MINIAUDIO` CMake option, default **OFF** — the default build stays
+  wav-only and dependency-free.
+- dispatch when ON: `loadWavAsStereo16` first, miniaudio fallback — no
+  extension sniffing, so wav files decode identically in both configs.
+- acquisition: FetchContent, pinned tag `0.11.25`, shallow, `SYSTEM` include —
+  the same pattern as Mbed TLS.
+
+### m4: the shared audio type (not done)
+
+the two readers will share one output type, `AudioData`:
+
+```cpp
+struct AudioData {
+    std::vector<int16_t> pcm;   // interleaved stereo
+    uint32_t sampleRate = 0;
+    bool ok = false;
+    std::string error;          // set when ok == false
+    size_t frames() const { return pcm.size() / 2; }
+};
+```
+
+- new `example/audio_data.h`; `WavAudio` renamed and moved there from
+  `wav_reader.h` (so `miniaudio_reader` can include it without including
+  `wav_reader`).
+- `wav_reader.{h,cpp}`: `loadWavAsStereo16` keeps its name (it is wav-specific)
+  and just returns `AudioData`; `airplay_send.cpp` gets the mechanical
+  `WavAudio` → `AudioData` renames. Purely mechanical, no behavior change.
+
+### m5: the optional miniaudio reader + flag (not done)
+
+- `CMakeLists.txt`: `option(ENABLE_MINIAUDIO ... OFF)`; inside the flag block,
+  `MINIAUDIO_BUILD_EXAMPLES/TESTS OFF` + `FetchContent` miniaudio `0.11.25` +
+  link `miniaudio` into `airplay-send`, define `WITH_MINIAUDIO`, and force
+  decoding-only compile defs on the miniaudio target
+  (`MA_NO_DEVICE_IO` / `MA_NO_ENCODING` / `MA_NO_GENERATION`) so it needs no
+  platform audio libs.
+- new `example/miniaudio_reader.{h,cpp}` with `loadWithMiniAudio`: whole-file
+  `ma_decoder` decode (s16 stereo output config, native sample rate) to the
+  same `AudioData` the wav reader produces, with the same ~1 GB size cap and
+  the same "clear error beats crash" error strings. miniaudio's converter does
+  mono→stereo duplication and >2ch→stereo downmix, so the feed loop is
+  untouched.
+- `example/airplay_send.cpp`: one guarded fallback —
+  `if (!audio.ok) audio = loadWithMiniAudio(o.wavPath);` — and the usage text
+  `<file.wav>` → `<file>` under the flag. flag-OFF build: byte-for-byte the
+  current code path, zero miniaudio symbols.
+
+### m6: docs, notices, and the verification pass (not done)
+
+- `README.md` / `example/README.md`: `-DENABLE_MINIAUDIO=ON` build
+  instructions and the supported-format matrix per config.
+- `CHANGELOG.md` entry; `licenses/THIRD-PARTY-NOTICES.txt`: a miniaudio
+  BUILD-TIME entry (pinned 0.11.25, real license text — CC0/MIT-0 as shipped)
+  following the Mbed TLS convention.
+- the verification pass from `MINIAUDIO_PLAN.md`: both configs build clean
+  under the warning-as-error settings (flag-OFF must be byte-for-byte the old
+  path; confirm no miniaudio symbols via `nm`); a wav file must decode
+  identically in both configs (wav reader always runs first); mp3/flac/ogg
+  (and opus if ffmpeg can encode it) smoke-tested via `airplay-send
+  --no-discover --host 127.0.0.1 /tmp/t.flac`, where the decode happens
+  before the connect attempt; truncated/empty/random inputs error cleanly;
+  grep the tree for stale "wav only" claims.
 
 ## later / maybe
 
 - buffered stream (type 103, TCP) alongside realtime (type 96, UDP).
 - AAC / Opus on receivers that advertise it (realtime is hardcoded-ALAC). this
   is about the on-wire stream codec; as input files, aac is out of scope too,
-  miniaudio's built-in decoders don't cover it (see the done list).
+  miniaudio's built-in decoders don't cover it (see the plan above).
 - multi-room / grouped output.
 - IPv6 in the default transport (the interface doesn't care; `PosixTransport`
   currently only binds/sends IPv4) and in `mdns_browser` (A records only today).
@@ -182,14 +237,14 @@ without growing the core the demo wires together.
   plumbing works, see the m3 note above; a live Apple TV pairing + a stored
   reconnect is the natural next confidence check).
 - streaming input for the demo (stdin / a growing file) instead of loading
-  the whole file into memory upfront. now that miniaudio is wired in, a
-  chunked-read pass through `ma_decoder` in the feed loop is the natural
-  first step; the wav reader can grow the same way.
+  the whole file into memory upfront. once m5 lands, a chunked-read pass
+  through `ma_decoder` in the feed loop is the natural first step; the wav
+  reader can grow the same way.
 
 ## want to help?
 
-the roadmap's three milestones are done; this is genuinely a working,
-standalone AirPlay 2 sender now. the wishlist above is what's left, and issues
-/ PRs against any of it are welcome, open one and let's talk. otherwise: try
-it against your own receiver and file a bug if something's off, that's worth
+the roadmap's original three milestones are done; the miniaudio milestones
+(m4-m6, see `MINIAUDIO_PLAN.md`) are next and not started. issues / PRs
+against any of it are welcome, open one and let's talk. otherwise: try it
+against your own receiver and file a bug if something's off, that's worth
 more than another feature right now.
