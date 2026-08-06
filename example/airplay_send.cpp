@@ -94,7 +94,7 @@ struct Options {
     uint16_t    port = 0;          // 0 = derive from --airplay1 / discovery
     bool        airplay1 = false;  // force legacy AirPlay 1 (skip HAP)
     std::string password;          // AirPlay 1 pw=true receivers
-    double      volume = 50.0;     // percent, applied once streaming starts
+    std::optional<double> volume;  // percent, applied once streaming starts if specified
     int         browseSeconds = 3;
     bool        noDiscover = false;
     bool        list = false;
@@ -126,7 +126,7 @@ void printUsage(const char* argv0) {
         "                       overrides whatever discovery found for --host)\n"
         "  --airplay1           force legacy AirPlay 1 (no HAP pairing)\n"
         "  --password <pw>      RTSP digest password (AirPlay 1 pw=true receivers)\n"
-        "  --volume <0-100>     percent volume once streaming starts (default: 50)\n"
+        "  --volume <0-100>     percent volume once streaming starts (default: leave untouched)\n"
         "  --browse-time <sec>  seconds to browse mDNS for (default: 3)\n"
         "  --no-discover        skip mDNS entirely (requires --host)\n"
         "  --list               print discovered devices and exit\n"
@@ -172,10 +172,12 @@ bool parseArgs(int argc, char** argv, Options& o) {
         else if (a == "--password") { auto v = need("--password"); if (!v) return false; o.password = *v; }
         else if (a == "--volume") {
             auto v = need("--volume"); if (!v) return false;
-            if (!parseDouble(*v, o.volume)) {
+            double vol = 0.0;
+            if (!parseDouble(*v, vol)) {
                 std::cerr << "error: --volume needs a number, got '" << *v << "'\n";
                 return false;
             }
+            o.volume = vol;
         }
         else if (a == "--browse-time") {
             auto v = need("--browse-time"); if (!v) return false;
@@ -337,7 +339,8 @@ int main(int argc, char** argv) {
         launchedOk = ok;
         if (ok) {
             std::cout << "streaming to '" << device.name << "'\n";
-            sender.setVolume(o.volume);
+            if (o.volume.has_value())
+                sender.setVolume(*o.volume);
         } else {
             std::cerr << "error: " << err << "\n";
         }
