@@ -1092,12 +1092,9 @@ void RaopSender::startStreaming_() {
     // uses the SAME SET_PARAMETER volume for AP1 AND AP2 (no separate AP2
     // surface), over the encrypted channel it just rides the same RTSP
     // connection.
-    // #90, an AP2 receiver can sit at its own (possibly muted) default until
-    // told otherwise, which reads as "connected but silent". If the user never
-    // set a cast volume, push 0 dB (no attenuation; the TV/AVR's own volume
-    // still governs the actual loudness) so audio is audible by default.
-    if (airplay2_ && pendingVolumeDb_ <= kNoVolume + 1.0)
-        pendingVolumeDb_ = 0.0;
+    // Never invent a volume on the receiver's behalf: if the caller didn't
+    // call setVolume(), leave the receiver's own current volume untouched
+    // (same policy for AP1 and AP2; see the setVolume doc in the header).
     if (pendingVolumeDb_ > kNoVolume + 1.0) {
         const std::string body = "volume: " + fixed6(pendingVolumeDb_);
         std::vector<std::pair<std::string, std::string>> vh;
