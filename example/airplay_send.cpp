@@ -98,6 +98,7 @@ struct Options {
     int         browseSeconds = 3;
     bool        noDiscover = false;
     bool        list = false;
+    bool        version = false;
     bool        help = false;
     std::string wavPath;
 };
@@ -129,7 +130,21 @@ void printUsage(const char* argv0) {
         "  --browse-time <sec>  seconds to browse mDNS for (default: 3)\n"
         "  --no-discover        skip mDNS entirely (requires --host)\n"
         "  --list               print discovered devices and exit\n"
+        "  -v, --version        show version info and compilation flags\n"
         "  -h, --help           this\n";}
+
+void printVersion() {
+    std::cout << "airplay-send (AirPlay 2 Sender)\n"
+              << "compilation flags & features:\n";
+#ifdef WITH_MINIAUDIO
+    std::cout << "  ENABLE_MINIAUDIO : ON (miniaudio 0.11.25, formats: wav, mp3, flac, ogg/vorbis, opus)\n";
+#else
+    std::cout << "  ENABLE_MINIAUDIO : OFF (built-in wav reader only)\n";
+#endif
+    std::cout << "  crypto backend   : Mbed TLS 3.6 + orlp/ed25519\n"
+              << "  transport        : PosixTransport (poll(2) + BSD sockets)\n"
+              << "  c++ standard     : C++20\n";
+}
 
 bool parseArgs(int argc, char** argv, Options& o) {
     std::vector<std::string> positional;
@@ -171,12 +186,17 @@ bool parseArgs(int argc, char** argv, Options& o) {
         }
         else if (a == "--no-discover") { o.noDiscover = true; }
         else if (a == "--list") { o.list = true; }
+        else if (a == "-v" || a == "--version") { o.version = true; }
         else if (!a.empty() && a[0] == '-') { std::cerr << "error: unknown option '" << a << "'\n"; return false; }
         else { positional.push_back(a); }
     }
-    if (o.help || o.list) return true;
+    if (o.help || o.list || o.version) return true;
     if (positional.size() != 1) {
+#ifdef WITH_MINIAUDIO
+        std::cerr << "error: expected exactly one <file> argument\n";
+#else
         std::cerr << "error: expected exactly one <file.wav> argument\n";
+#endif
         return false;
     }
     o.wavPath = positional.front();
@@ -262,6 +282,7 @@ int main(int argc, char** argv) {
     Options o;
     if (!parseArgs(argc, argv, o)) { printUsage(argv[0]); return 2; }
     if (o.help) { printUsage(argv[0]); return 0; }
+    if (o.version) { printVersion(); return 0; }
 
     std::vector<RaopDeviceInfo> found;
     if (!o.noDiscover) {

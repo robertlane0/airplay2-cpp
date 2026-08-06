@@ -19,6 +19,10 @@ Makefile
 *.ilk
 *.exp
 *.wav
+*.mp3
+*.flac
+*.ogg
+*.opus
 airplay-send
 # ide
 .vs/
