@@ -2,10 +2,10 @@
 
 prs and issues welcome. this is a small, focused project, all three
 `ROADMAP.md` milestones are done (Qt-free sender, mDNS discovery, and the
-`airplay-send` CLI demo). the fastest way in now is the README recipe +
-`ROADMAP.md`'s "later / maybe" list, or just: run `airplay-send` against your
-own receiver and file an issue if something's off, real-device reports are
-the highest-value thing right now.
+`airplay-send` CLI demo) plus the optional miniaudio flag. the fastest way in
+now is the README recipe + `ROADMAP.md`'s "later / maybe" list, or just: run
+`airplay-send` against your own receiver and file an issue if something's off,
+real-device reports are the highest-value thing right now.
 
 ## the one rule that actually matters: stay clean-room
 
@@ -31,9 +31,12 @@ holds if we are careful about where code comes from:
   function with the same care as the crypto core, documentation only, no
   pasted code, and be honest in comments about what's verified vs. guessed.
 
-- `example/` (the `airplay-send` CLI, the wav reader, the credential cache) has
-  no clean-room concern either, it's plumbing + an open file format (RIFF/WAVE),
-  not protocol reconstruction. Normal code-review standards apply there.
+- `example/` (the `airplay-send` CLI, the wav reader, the optional miniaudio
+  reader, the credential cache) has no clean-room concern either, it's plumbing
+  + open file formats (RIFF/WAVE, and via miniaudio: mp3/flac/ogg/opus), not
+  protocol reconstruction. Normal code-review standards apply there. the
+  miniaudio reader only builds under `-DENABLE_MINIAUDIO=ON`; keep the default
+  build free of any miniaudio reference.
 
 when in doubt, describe the protocol behaviour in your own words and implement
 from that. if you're unsure whether something is OK to bring in, open an issue
@@ -45,6 +48,8 @@ first and ask.
 - build the sender: `cmake --build build --target raop_sender posix_transport`.
 - build the mDNS browser: `cmake --build build --target mdns_browser`.
 - build the CLI demo: `cmake --build build --target airplay-send`.
+- build the CLI demo with miniaudio (mp3/flac/ogg/opus): `cmake -B build
+  -DENABLE_MINIAUDIO=ON && cmake --build build --target airplay-send`.
 - keep the prose voice as-is (lowercase, plain). no em-dashes in comments/docs.
 - authorship: commits are by their author; no AI-attribution / `Co-Authored-By`
   trailers, please.

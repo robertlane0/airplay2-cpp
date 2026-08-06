@@ -60,6 +60,18 @@ ed25519 (orlp/ed25519)
   pair-verify exchange, the one primitive Mbed TLS 3.6 doesn't provide.
   Full zlib text reproduced below and in third_party/ed25519/LICENSE.txt.
 
+miniaudio 0.11.25 (mackron)
+  Copyright (c) 2025 David Reid
+  License: Unlicense (public domain) OR MIT-0 (dual-licensed; either applies)
+  https://github.com/mackron/miniaudio
+  Fetched via CMake FetchContent at configure time, ONLY when the build is
+  configured with -DENABLE_MINIAUDIO=ON (pinned tag 0.11.25). Single-header C
+  library providing the ma_decoder fallback reader in
+  example/miniaudio_reader.cpp (MP3 / FLAC / OGG-Vorbis / Opus via its built-in
+  dr_mp3 / dr_flac / stb_vorbis / dr_opus decoders). Built decoding-only
+  (MA_NO_DEVICE_IO / MA_NO_ENCODING / MA_NO_GENERATION), so it needs no
+  platform audio libraries. Full license texts reproduced below.
+
 
 ================================================================================
 LICENSE TEXTS
@@ -108,6 +120,54 @@ the following restrictions:
 2. Altered source versions must be plainly marked as such, and must not be
    misrepresented as being the original software.
 3. This notice may not be removed or altered from any source distribution.
+
+--------------------------------------------------------------------------------
+Unlicense (Public Domain)
+--------------------------------------------------------------------------------
+Applies to: miniaudio (alternative 1 of its dual license).
+
+This is free and unencumbered software released into the public domain.
+
+Anyone is free to copy, modify, publish, use, compile, sell, or distribute this
+software, either in source code form or as a compiled binary, for any purpose,
+commercial or non-commercial, and by any means.
+
+In jurisdictions that recognize copyright laws, the author or authors of this
+software dedicate any and all copyright interest in the software to the public
+domain. We make this dedication for the benefit of the public at large and to
+the detriment of our heirs and successors. We intend this dedication to be an
+overt act of relinquishment in perpetuity of all present and future rights to
+this software under copyright law.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+For more information, please refer to <http://unlicense.org/>
+
+--------------------------------------------------------------------------------
+MIT No Attribution (MIT-0)
+--------------------------------------------------------------------------------
+Applies to: miniaudio, Copyright 2025 David Reid (alternative 2 of its dual
+license).
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 --------------------------------------------------------------------------------
 Apache License 2.0

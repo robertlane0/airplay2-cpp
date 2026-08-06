@@ -1,6 +1,21 @@
 # changelog
 
 ## unreleased
+- **miniaudio: the demo plays more than wav, optionally.** New
+  `ENABLE_MINIAUDIO` CMake flag (default **OFF**; full plan in
+  `MINIAUDIO_PLAN.md`). The flag build fetches miniaudio 0.11.25 (FetchContent,
+  pinned tag, decode-only: `MA_NO_DEVICE_IO` / `MA_NO_ENCODING` /
+  `MA_NO_GENERATION`) and compiles a second reader,
+  `example/miniaudio_reader.{h,cpp}` (`loadWithMiniAudio`), so `airplay-send`
+  decodes mp3 / flac / ogg (vorbis) / opus as well as wav. Dispatch is
+  fallback-based: the fuzz-tested `loadWavAsStereo16` runs first, miniaudio
+  only when it fails, so the default build stays byte-for-byte the wav-only
+  code path with zero miniaudio references. Both readers share one output
+  type: `WavAudio` moved to a new `example/audio_data.h` and became
+  `AudioData`. aac is a documented non-goal (miniaudio's built-in decoders
+  don't cover it). README / example README carry the build instructions and
+  the per-config format matrix; miniaudio's license is in
+  `licenses/THIRD-PARTY-NOTICES.txt`.
 - **ROADMAP.md m3: the CLI demo.** Added `airplay-send` (`example/`): browses
   for a receiver via `mdns_browser`, connects and streams a `.wav` through
   `raop_sender` + `PosixTransport`, tears down cleanly on ctrl-c or

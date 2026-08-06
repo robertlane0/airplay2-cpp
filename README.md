@@ -8,6 +8,7 @@
   <img src="https://img.shields.io/badge/C%2B%2B-20-00599c" alt="C++20">
   <img src="https://img.shields.io/badge/protocol-AirPlay%202%20realtime-ff5e00" alt="AirPlay 2 realtime">
   <img src="https://img.shields.io/badge/codec-ALAC%20lossless-8a2be2" alt="ALAC lossless">
+  <img src="https://img.shields.io/badge/formats-WAV%20built--in%20%C2%B7%20%2BMP3%2FFLAC%2FOGG%2FOpus%20optional-4caf50" alt="formats: WAV built-in, more via optional flag">
   <img src="https://img.shields.io/badge/crypto-ChaCha20--Poly1305%20%C2%B7%20X25519%20%C2%B7%20SRP--6a-blue" alt="crypto">
   <a href="https://github.com/akustikrausch/FXChainPlayer-Releases"><img src="https://img.shields.io/badge/proven%20in-FXChainPlayer-6c7bff" alt="proven in FXChainPlayer"></a>
 </p>
@@ -16,6 +17,15 @@ a working, verified **AirPlay 2 realtime-audio SENDER** in c++. it pairs with a
 modern **Apple TV 4K**, a **HomePod**, or a **macOS** receiver, and streams clean,
 lossless **ALAC** to it over the encrypted RAOP/RTSP path apple actually uses
 today. bidirectional volume, seamless track changes, the works.
+
+the project is deliberately shaped like a **simple core, not a media player**:
+a small Qt-free library (the crypto/wire-format core, the sender state machine,
+the transport, a tiny mDNS browser) plus a thin reference CLI that proves it.
+**wav support is built in and nothing else is**; one optional CMake flag
+(`-DENABLE_MINIAUDIO=ON`, default **OFF**) pulls in
+[miniaudio](https://miniaudio.com) and lets the same CLI play **mp3 / flac /
+ogg (vorbis) / opus** too, with zero changes to the library code you'd embed.
+the default build stays `git clone && cmake && run`, dependency-free.
 
 this is the part of the apple-tax that nobody published. you can find a hundred
 *receivers*. you can find python. you cannot find a small c++ thing that just
@@ -130,7 +140,9 @@ src/
   ring_buffer.h             the lock-free spsc tap the audio thread feeds
 example/
   airplay_send.cpp          the airplay-send CLI: wires everything above together
-  wav_reader.h    / .cpp    a small RIFF/WAVE -> interleaved-stereo-int16 reader
+  audio_data.h              AudioData, the shared decode output type (both readers)
+  wav_reader.h    / .cpp    the built-in RIFF/WAVE -> interleaved-stereo-int16 reader
+  miniaudio_reader.h / .cpp the optional fallback reader (built with -DENABLE_MINIAUDIO=ON)
   creds_store.h   / .cpp    the per-device HAP credential cache (~/.cache/airplay-send/)
 third_party/ed25519/        the one primitive mbed tls lacks (zlib, vendored)
 ```
@@ -152,9 +164,58 @@ know an IP: a small hand-rolled mDNS/DNS-SD client (no avahi, no dns-sd, no
 Bonjour SDK) that answers "what AirPlay/RAOP devices are out there, and what
 port/auth do I need to reach them."
 
-**`airplay-send`** is the CLI demo: run it with zero flags and a wav file and
-it browses, connects, pairs if it has to, and streams. See `--help`, or the
-example below.
+**`airplay-send`** is the reference CLI for the core: run it with zero flags
+and an audio file and it browses, connects, pairs if it has to, and streams.
+See `--help`, or the examples below.
+
+## input formats
+
+the decode layer is the one place this project draws a line, and it draws it
+per build:
+
+| build | formats |
+|---|---|
+| default (`ENABLE_MINIAUDIO=OFF`) | **wav**: RIFF/WAVE, 8/16/24/32-bit PCM + float32, mono or stereo, any sample rate |
+| `-DENABLE_MINIAUDIO=ON` | everything above, **plus mp3, flac, ogg/vorbis, opus** |
+
+the default build contains zero miniaudio references. the flag fetches
+miniaudio **0.11.25** (pinned tag, FetchContent, decode-only, same pattern as
+Mbed TLS) and compiles a second reader that is only ever a **fallback**:
+`airplay-send` asks the fuzz-tested built-in wav reader first, and only when
+that says "not a wav" does miniaudio get a shot. no extension sniffing, so a
+misnamed file still plays if the bytes decode; a wav is decoded by the wav
+reader in both configs, byte-for-byte identically.
+
+aac is the documented gap: miniaudio's built-in decoders don't include it
+(it needs an external backend), so aac stays out of scope. everything else
+plays.
+
+## build and run
+
+default build, wav only, nothing extra fetched beyond Mbed TLS:
+
+```
+$ cmake -B build && cmake --build build --target airplay-send
+$ ./build/airplay-send living_room.wav
+browsing for AirPlay/RAOP devices (3s)...
+target: [AirPlay 2] Living Room  10.0.0.42:7000  (AppleTV14,1)
+loaded 'living_room.wav': 1323000 frames @ 44100 Hz (30s)
+streaming to 'Living Room'
+```
+
+"everything else", one flag:
+
+```
+$ cmake -B build -DENABLE_MINIAUDIO=ON && cmake --build build --target airplay-send
+$ ./build/airplay-send song.mp3
+$ ./build/airplay-send track.flac
+$ ./build/airplay-send podcast.opus
+```
+
+the `airplay-send` usage text says `<file>` instead of `<file.wav>` when built
+with the flag, for the obvious reason. either way, zero flags is the whole
+pitch: it browses, picks a receiver (preferring AirPlay 2), streams, and tears
+down cleanly on ctrl-c or end-of-file.
 
 ## status (read me)
 
@@ -164,15 +225,9 @@ casts to a real Apple TV 4K (`AppleTV14,1`) and a MacBook every day. as of
 **Qt-free** (talks to the network only through `ITransport`, `PosixTransport`
 as the default `poll()` + BSD-sockets adapter, no Qt, no host headers),
 receiver discovery has no host glue either (`mdns_browser`, a small
-dependency-free mDNS client), and there's a real CLI you can build and run:
-
-```
-$ cmake -B build && cmake --build build --target airplay-send
-$ ./build/airplay-send living_room.wav
-browsing for AirPlay/RAOP devices (3s)...
-target: [AirPlay 2] Living Room  10.0.0.42:7000  (AppleTV14,1)
-streaming to 'Living Room'
-```
+dependency-free mDNS client), and there's a real CLI you can build and run.
+**miniaudio** is optional and off by default: the default build is the exact
+same wav-only, dependency-light code it has always been.
 
 all four build as CMake targets (`raop_sender`, `posix_transport`,
 `mdns_browser`, `airplay-send`) and have been run end-to-end against
@@ -182,11 +237,13 @@ discover-and-play path, ctrl-c mid-stream (a real TEARDOWN reaches the
 receiver), and the HAP on-screen-PIN prompt (stdin → pairing, confirmed
 byte-exact on the fake device's side). the wav reader and mDNS parser were
 separately fuzzed under ASan/UBSan (malformed files / malformed packets) with
-zero crashes. a **real device** is still the best test, that hasn't happened
-yet for this standalone extraction specifically (as opposed to the protocol
-logic itself, which runs on real Apple TVs/HomePods/Macs daily inside
-FXChainPlayer, see above); if you try it against your own receiver and
-something's off, please file an issue.
+zero crashes. the flag-ON build has been smoke-tested by decoding mp3/flac/ogg
+converted from repo wavs with `ffmpeg` (decode happens before the connect
+attempt, so even a bogus host proves the loader). a **real device** is still
+the best test, that hasn't happened yet for this standalone extraction
+specifically (as opposed to the protocol logic itself, which runs on real
+Apple TVs/HomePods/Macs daily inside FXChainPlayer, see above); if you try it
+against your own receiver and something's off, please file an issue.
 
 if you want the polished player it lives in, here:
 
@@ -210,7 +267,8 @@ anything via `SECURITY.md`.
 
 ## license
 
-**Apache-2.0** for everything in `src/`. © 2026 Andreas Wendorf (Akustikrausch).
+**Apache-2.0** for everything in `src/` and `example/`. © 2026 Andreas Wendorf
+(Akustikrausch).
 
 apache-2.0 on purpose: this is *reverse-engineered apple-protocol* code, so the
 license carries an **explicit patent grant**, so you can embed it in a product
@@ -228,7 +286,8 @@ provenance, split honestly:
   notice rides along in [`licenses/THIRD-PARTY-NOTICES.txt`](licenses/THIRD-PARTY-NOTICES.txt).
 
 vendored / build deps keep their own licenses: **Mbed TLS** Apache-2.0,
-**ed25519** zlib, same file has the details.
+**ed25519** zlib, **miniaudio** (Unlicense OR MIT-0, fetched only when
+`ENABLE_MINIAUDIO=ON`); same file has the details.
 
 ## disclaimer
 
@@ -243,5 +302,3 @@ this is interoperability work in the legal sense: it relies on the
 decompilation / interoperability right under **article 6 of eu directive
 2009/24/ec** (the *software directive*), reimplements the protocol clean-room,
 and ships none of apple's code, keys, or certificates.
-
-

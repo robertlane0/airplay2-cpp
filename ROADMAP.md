@@ -1,8 +1,10 @@
 # roadmap
 
-**all three milestones are done.** what started as "lifted out of a working
-player" is now a `git clone && cmake && run` standalone: Qt-free, no host
-glue, a CLI that discovers a receiver and streams a wav to it.
+**all three milestones are done, and so is the optional miniaudio flag.** what
+started as "lifted out of a working player" is now a `git clone && cmake &&
+run` standalone: Qt-free, no host glue, a CLI that discovers a receiver and
+streams audio to it (wav out of the box, mp3/flac/ogg/opus with
+`-DENABLE_MINIAUDIO=ON`).
 
 ## done
 
@@ -44,6 +46,19 @@ glue, a CLI that discovers a receiver and streams a wav to it.
   failed to persist on a machine with no pre-existing `~/.cache` (both
   covered above by tests now). The wav reader was separately fuzzed with 38
   malformed files under ASan/UBSan.
+- **miniaudio, optional: the demo plays more than wav.** New `ENABLE_MINIAUDIO`
+  CMake option (default **OFF**; see `MINIAUDIO_PLAN.md` for the full plan): the
+  flag build fetches miniaudio 0.11.25 (FetchContent, pinned tag, decode-only
+  defines) and compiles `example/miniaudio_reader.{h,cpp}`
+  (`loadWithMiniAudio`), so `airplay-send` decodes **mp3 / flac / ogg (vorbis) /
+  opus** in addition to wav. Dispatch is fallback-based: the fuzz-tested
+  `loadWavAsStereo16` always runs first and miniaudio is only asked when it
+  fails, so the default build is byte-for-byte the wav-only code path and
+  wav files decode identically in both configs. The two readers share one
+  output type, `AudioData` (new `example/audio_data.h`; the old `WavAudio`
+  struct moved there and was renamed). aac is a documented non-goal, miniaudio's
+  built-in decoders don't cover it. Whole-file decode, same as the wav reader;
+  streaming decode is the natural follow-up, noted below.
 
 ## the path to standalone
 
@@ -144,13 +159,18 @@ stdin; a successful pairing is cached under `~/.cache/airplay-send/` (or
 `$XDG_CACHE_HOME`) so the next run skips it.
 
 wav support: 8/16/24/32-bit PCM integer + 32-bit float, mono or stereo (extra
-channels dropped), any sample rate (`RaopSender` resamples to 44.1 kHz). Not
-a general media library, on purpose, this is a demo, not a decoder.
+channels dropped), any sample rate (`RaopSender` resamples to 44.1 kHz). Not a
+general media library, on purpose: wav is built in and nothing else is. the
+optional `ENABLE_MINIAUDIO=ON` build (see the done list above) extends the same
+binary to mp3 / flac / ogg (vorbis) / opus via a miniaudio fallback reader,
+without growing the core the demo wires together.
 
 ## later / maybe
 
 - buffered stream (type 103, TCP) alongside realtime (type 96, UDP).
-- AAC / Opus on receivers that advertise it (realtime is hardcoded-ALAC).
+- AAC / Opus on receivers that advertise it (realtime is hardcoded-ALAC). this
+  is about the on-wire stream codec; as input files, aac is out of scope too,
+  miniaudio's built-in decoders don't cover it (see the done list).
 - multi-room / grouped output.
 - IPv6 in the default transport (the interface doesn't care; `PosixTransport`
   currently only binds/sends IPv4) and in `mdns_browser` (A records only today).
@@ -162,7 +182,9 @@ a general media library, on purpose, this is a demo, not a decoder.
   plumbing works, see the m3 note above; a live Apple TV pairing + a stored
   reconnect is the natural next confidence check).
 - streaming input for the demo (stdin / a growing file) instead of loading
-  the whole wav into memory upfront.
+  the whole file into memory upfront. now that miniaudio is wired in, a
+  chunked-read pass through `ma_decoder` in the feed loop is the natural
+  first step; the wav reader can grow the same way.
 
 ## want to help?
 

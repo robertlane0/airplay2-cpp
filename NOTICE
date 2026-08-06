@@ -20,6 +20,8 @@ keep their own licenses (full texts in licenses/THIRD-PARTY-NOTICES.txt):
   pair_ap (SRP padding spec)    MIT, (c) Espen Jürgensen
   third_party/ed25519/          zlib, (c) 2015 Orson Peters
   Mbed TLS (fetched)            Apache-2.0 OR GPL-2.0-or-later (used: Apache-2.0)
+  miniaudio (fetched, only with -DENABLE_MINIAUDIO=ON)
+                                Unlicense OR MIT-0, (c) 2025 David Reid
 
 Trademarks / disclaimer:
   This project is NOT affiliated with, authorized, endorsed by, or in any way
