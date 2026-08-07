@@ -1,6 +1,17 @@
 # changelog
 
 ## unreleased
+- **stale credentials: `airplay-send` no longer hangs on a receiver that reset
+  its pairing.** `RaopSender` now reports a rejected pair-verify via
+  `credsRejected()` (set when the receiver refuses stored credentials, or
+  stalls at the verify stage while cached creds are in use). A new
+  `HEADLESS_DEFAULT` CMake option (**OFF**, overridable at runtime) decides
+  the default: with the default build, stale credentials trigger a fresh PIN
+  re-authentication prompt; headless builds fail immediately with a
+  message. Two new flags, `--headless` and `--interactive`, override the
+  build default (last flag wins); `--help` annotates which flag is the
+  default / has no effect and `--version` prints the build-time
+  `HEADLESS_DEFAULT: ON/OFF`.
 - **miniaudio: the demo plays more than wav, optionally.** New
   `ENABLE_MINIAUDIO` CMake flag (default **OFF**; full plan in
   `MINIAUDIO_PLAN.md`). The flag build fetches miniaudio 0.11.25 (FetchContent,

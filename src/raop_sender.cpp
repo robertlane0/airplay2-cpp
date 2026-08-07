@@ -343,6 +343,13 @@ void RaopSender::onHandshakeTimeout_() {
         Log::warn("Cast: AirPlay handshake TIMEOUT, state={} pairStage={} "
                   "(receiver sent no usable reply)",
                   static_cast<int>(state_), static_cast<int>(pairStage_));
+        // A receiver that reset its paired-device list often just STOPS
+        // answering pair-verify when we present the now-stale stored
+        // credentials; a verify-stage stall with cached creds in use counts
+        // as a rejection so the caller can re-pair instead of hanging.
+        if (!credsJson_.empty() &&
+            (pairStage_ == PairStage::VerifyM2 || pairStage_ == PairStage::VerifyDone))
+            credsRejected_ = true;
         fail_("Timed out waiting for the device");
     }
 }
@@ -456,6 +463,7 @@ void RaopSender::start(const std::string& host, uint16_t port, const std::string
     ap2_.reset();
     pairStage_       = PairStage::None;   // never carry a stale stage in
     waitingForPin_   = false;
+    credsRejected_   = false;
     triedTransientAfterPin403_ = false;
     inHttpMode_      = false;
     digestRealm_.clear();
@@ -1573,6 +1581,10 @@ void RaopSender::handlePairVerifyM2_(const std::string& body) {
     using namespace airplay;
     const tlv::Map m = tlv::decode(toBytes(body));
     if (auto err = tlv::get(m, tlv::Error)) {
+        // The receiver rejected our presented (likely stored) credentials --
+        // it may have reset its paired-device list. Flag it so the caller
+        // can re-pair with a PIN instead of giving up.
+        if (!credsJson_.empty()) credsRejected_ = true;
         fail_(Log::format("Pair-verify rejected (error {})", err->empty() ? 0 : (*err)[0]));
         return;
     }
@@ -1590,7 +1602,10 @@ void RaopSender::handlePairVerifyM2_(const std::string& body) {
                                        ap2_->sharedSecret, 32);
     const Bytes nonce02 = toBytes(std::string("PV-Msg02"));
     auto dec = chacha20Poly1305Decrypt(verifyKey, nonce02, *encrypted, {});
-    if (!dec) { fail_("Pair-verify could not be decrypted"); return; }
+    if (!dec) {
+        if (!credsJson_.empty()) credsRejected_ = true;   // can't decrypt → likely stale creds
+        fail_("Pair-verify could not be decrypted"); return;
+    }
     const tlv::Map sub = tlv::decode(*dec);
     auto atvId = tlv::get(sub, tlv::Identifier);
     auto atvSig = tlv::get(sub, tlv::Signature);

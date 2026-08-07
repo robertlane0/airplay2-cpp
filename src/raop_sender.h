@@ -113,6 +113,12 @@ public:
     void submitPin(const std::string& code);
     bool waitingForPin() const { return waitingForPin_; }
 
+    // True after a failed session if the receiver rejected the STORED
+    // long-term credentials (pair-verify failed while cached creds were in
+    // use) -- the receiver reset its paired-device list. The caller uses
+    // this to decide between re-pairing with a PIN and failing immediately.
+    bool credsRejected() const { return credsRejected_; }
+
     // Receiver volume, 0..100 % → AirPlay dBFS (-30..0; 0 % = -144 mute,
     // the pyatv pct_to_dbfs mapping). Not sent automatically at start so
     // the receiver keeps its own current volume.
@@ -340,6 +346,9 @@ private:
     std::string credsJson_;       // stored long-term creds (empty = first pair)
     std::string digestPassword_;  // pw=true RTSP digest password
     bool        waitingForPin_ = false;
+    // Set when pair-verify fails while stored credentials were in use (the
+    // receiver rejected the cached creds). Read via credsRejected().
+    bool        credsRejected_ = false;
     // One-shot: a Mac-style receiver 403s /pair-pin-start (Macs don't show an
     // on-screen AirPlay PIN), we then try PIN-less transient pairing once.
     bool        triedTransientAfterPin403_ = false;

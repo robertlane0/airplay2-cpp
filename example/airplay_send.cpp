@@ -39,6 +39,15 @@ using namespace fxchain;
 
 namespace {
 
+// Build-time default for the --headless / --interactive pair, set by the
+// CMake HEADLESS_DEFAULT option: 1 = fail immediately when cached
+// credentials are stale (never prompt for a PIN), 0 = prompt the user to
+// re-pair with a PIN. The runtime flags override it; --version reports it.
+#ifndef HEADLESS_DEFAULT
+#define HEADLESS_DEFAULT 0
+#endif
+constexpr bool kHeadlessDefault = HEADLESS_DEFAULT != 0;
+
 volatile std::sig_atomic_t g_stop = 0;
 void onSigint(int) { g_stop = 1; }
 
@@ -97,6 +106,9 @@ struct Options {
     std::optional<double> volume;  // percent, applied once streaming starts if specified
     int         browseSeconds = 3;
     bool        noDiscover = false;
+    // --headless → true, --interactive → false; last one wins. Absent =
+    // build-time HEADLESS_DEFAULT (kHeadlessDefault below).
+    std::optional<bool> headlessMode;
     bool        list = false;
     bool        version = false;
     bool        help = false;
@@ -130,6 +142,12 @@ void printUsage(const char* argv0) {
         "  --browse-time <sec>  seconds to browse mDNS for (default: 3)\n"
         "  --no-discover        skip mDNS entirely (requires --host)\n"
         "  --list               print discovered devices and exit\n"
+        "  --headless           fail immediately if cached credentials are stale,\n"
+        "                       never prompt for a PIN"
+        << (kHeadlessDefault ? " [default; no effect]" : " [overrides the default]") << "\n"
+        "  --interactive        prompt for a PIN to re-authenticate if cached\n"
+        "                       credentials are stale"
+        << (kHeadlessDefault ? " [overrides the default]" : " [default; no effect]") << "\n"
         "  -v, --version        show version info and compilation flags\n"
         "  -h, --help           this\n";}
 
@@ -141,7 +159,11 @@ void printVersion() {
 #else
     std::cout << "  ENABLE_MINIAUDIO : OFF (built-in wav reader only)\n";
 #endif
-    std::cout << "  crypto backend   : Mbed TLS 3.6 + orlp/ed25519\n"
+    std::cout << "  HEADLESS_DEFAULT : " << (kHeadlessDefault ? "ON" : "OFF")
+              << (kHeadlessDefault
+                      ? " (stale credentials fail immediately; --interactive enables PIN prompts)"
+                      : " (stale credentials prompt for a PIN; --headless disables)") << "\n"
+              << "  crypto backend   : Mbed TLS 3.6 + orlp/ed25519\n"
               << "  transport        : PosixTransport (poll(2) + BSD sockets)\n"
               << "  c++ standard     : C++20\n";
 }
@@ -187,6 +209,8 @@ bool parseArgs(int argc, char** argv, Options& o) {
             }
         }
         else if (a == "--no-discover") { o.noDiscover = true; }
+        else if (a == "--headless") { o.headlessMode = true; }
+        else if (a == "--interactive") { o.headlessMode = false; }
         else if (a == "--list") { o.list = true; }
         else if (a == "-v" || a == "--version") { o.version = true; }
         else if (!a.empty() && a[0] == '-') { std::cerr << "error: unknown option '" << a << "'\n"; return false; }
@@ -278,6 +302,120 @@ std::optional<RaopDeviceInfo> resolveDevice(const Options& o, const std::vector<
     return device;
 }
 
+// How one streaming session ended, so the caller can decide whether to
+// re-pair (stale credentials) or give up.
+enum class SessionResult { Ok, Stopped, Failed, StaleCreds };
+
+// Run one full streaming session against `device`. `credsJson` carries the
+// stored long-term credentials (empty = first pairing / re-pairing).
+// `headless` suppresses the PIN prompt: if the receiver asks for a code the
+// session is aborted instead of blocking on stdin.
+SessionResult runSession(const RaopDeviceInfo& device, const AudioData& audio,
+                         const Options& o, bool headless, const std::string& credsJson) {
+    PosixTransport io;
+    RaopSender sender(io);
+
+    // Roughly a second of stereo audio at the file's native rate; plenty of
+    // headroom for the ~8 ms pacer to pull from without the feed loop below
+    // needing to be especially tight about topping it up.
+    RingBuffer<int16_t> ring(size_t(std::max<uint32_t>(audio.sampleRate, 8000)) * 2);
+    sender.attachRing(&ring);
+    sender.setInputFormat(audio.sampleRate);
+
+    bool launchDone = false, launchedOk = false, sessionClosed = false;
+    bool pinPromptSuppressed = false;   // headless: receiver wants a PIN we won't collect
+
+    sender.onLaunched = [&](bool ok, const std::string& err) {
+        launchDone = true;
+        launchedOk = ok;
+        if (ok) {
+            std::cout << "streaming to '" << device.name << "'\n";
+            if (o.volume.has_value())
+                sender.setVolume(*o.volume);
+        } else {
+            std::cerr << "error: " << err << "\n";
+        }
+    };
+    sender.onClosed = [&] { sessionClosed = true; };
+    sender.onPinRequired = [&](const std::string& name) {
+        if (headless) {
+            // A headless run can't collect a code from the user; abort the
+            // session instead of blocking on stdin until the PIN watchdog.
+            std::cerr << "error: '" << name << "' requires a PIN but interactive "
+                         "prompts are disabled (--headless / HEADLESS_DEFAULT=ON); "
+                         "run without --headless to pair.\n";
+            pinPromptSuppressed = true;
+            return;
+        }
+        // Blocks the poll loop while waiting for input, which is fine here:
+        // there's nothing else useful to do concurrently in a one-shot CLI
+        // tool, and RaopSender's own PIN-wait watchdog (3 min) just runs a
+        // little "late" relative to wall clock, it's checked the instant
+        // poll() resumes after this returns, not on a background thread.
+        std::cout << "\nenter the 4-digit AirPlay code shown on '" << name << "': " << std::flush;
+        std::string pin;
+        std::getline(std::cin, pin);
+        sender.submitPin(trimmed(pin));
+    };
+    sender.onCredentialsObtained = [&](const std::string& id, const std::string& json) {
+        saveCachedCreds(id, json);
+        std::cout << "paired; credentials cached for next time\n";
+    };
+
+    sender.setAuth(device.auth, device.airplay2, device.deviceId, credsJson, o.password);
+    sender.start(device.host, device.port, device.name);
+
+    size_t offset = 0;
+    const size_t totalSamples = audio.pcm.size();
+    bool fileQueued = false, draining = false;
+    std::chrono::steady_clock::time_point drainDeadline{};
+    auto lastProgress = std::chrono::steady_clock::now();
+
+    while (!g_stop && !sessionClosed && !pinPromptSuppressed) {
+        while (offset < totalSamples) {
+            const size_t avail = ring.availableWrite();
+            if (avail < 2) break;
+            size_t chunk = std::min(avail, totalSamples - offset);
+            chunk -= chunk % 2;   // keep stereo-frame alignment
+            if (chunk == 0) break;
+            if (!ring.tryPush(std::span<const int16_t>(audio.pcm.data() + offset, chunk))) break;
+            offset += chunk;
+        }
+        if (offset >= totalSamples) fileQueued = true;
+
+        io.poll(16);
+
+        const auto now = std::chrono::steady_clock::now();
+        if (launchDone && launchedOk && now - lastProgress >= std::chrono::milliseconds(1000)) {
+            lastProgress = now;
+            const double queuedSec = double(offset / 2) / double(audio.sampleRate);
+            const double totalSec  = double(totalSamples / 2) / double(audio.sampleRate);
+            std::cout << "\r" << queuedSec << "s / " << totalSec << "s queued   " << std::flush;
+        }
+
+        if (fileQueued && !draining && launchDone && ring.availableRead() == 0) {
+            draining = true;
+            // RAOP's fixed pipeline latency is ~1.5 s (see raop_sender.h);
+            // give it a little extra margin so the last packets are
+            // actually audible at the receiver before TEARDOWN.
+            drainDeadline = now + std::chrono::milliseconds(2500);
+            std::cout << "\nfile fully queued, letting the tail play out...\n";
+        }
+        if (draining && now >= drainDeadline) break;
+    }
+
+    std::cout << "\n";
+    if (g_stop) std::cout << "stopping (ctrl-c)...\n";
+    sender.stop();   // synchronous: TEARDOWN + socket close happen inline
+    std::cout << "done\n";
+
+    if (launchDone && launchedOk) return SessionResult::Ok;
+    if (launchDone && !launchedOk)
+        return sender.credsRejected() ? SessionResult::StaleCreds : SessionResult::Failed;
+    if (g_stop) return SessionResult::Stopped;
+    return SessionResult::Failed;   // aborted (headless PIN) or loop ended without a launch
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -322,93 +460,36 @@ int main(int argc, char** argv) {
     if (!cachedCreds.empty())
         std::cout << "using cached credentials for this device\n";
 
-    PosixTransport io;
-    RaopSender sender(io);
-
-    // Roughly a second of stereo audio at the file's native rate; plenty of
-    // headroom for the ~8 ms pacer to pull from without the feed loop below
-    // needing to be especially tight about topping it up.
-    RingBuffer<int16_t> ring(size_t(std::max<uint32_t>(audio.sampleRate, 8000)) * 2);
-    sender.attachRing(&ring);
-    sender.setInputFormat(audio.sampleRate);
-
-    bool launchDone = false, launchedOk = false, sessionClosed = false;
-
-    sender.onLaunched = [&](bool ok, const std::string& err) {
-        launchDone = true;
-        launchedOk = ok;
-        if (ok) {
-            std::cout << "streaming to '" << device.name << "'\n";
-            if (o.volume.has_value())
-                sender.setVolume(*o.volume);
-        } else {
-            std::cerr << "error: " << err << "\n";
-        }
-    };
-    sender.onClosed = [&] { sessionClosed = true; };
-    sender.onPinRequired = [&](const std::string& name) {
-        // Blocks the poll loop while waiting for input, which is fine here:
-        // there's nothing else useful to do concurrently in a one-shot CLI
-        // tool, and RaopSender's own PIN-wait watchdog (3 min) just runs a
-        // little "late" relative to wall clock, it's checked the instant
-        // poll() resumes after this returns, not on a background thread.
-        std::cout << "\nenter the 4-digit AirPlay code shown on '" << name << "': " << std::flush;
-        std::string pin;
-        std::getline(std::cin, pin);
-        sender.submitPin(trimmed(pin));
-    };
-    sender.onCredentialsObtained = [&](const std::string& id, const std::string& json) {
-        saveCachedCreds(id, json);
-        std::cout << "paired; credentials cached for next time\n";
-    };
-
+    const bool headless = o.headlessMode.value_or(kHeadlessDefault);
     std::signal(SIGINT, onSigint);
 
-    sender.setAuth(device.auth, device.airplay2, device.deviceId, cachedCreds, o.password);
-    sender.start(device.host, device.port, device.name);
-
-    size_t offset = 0;
-    const size_t totalSamples = audio.pcm.size();
-    bool fileQueued = false, draining = false;
-    std::chrono::steady_clock::time_point drainDeadline{};
-    auto lastProgress = std::chrono::steady_clock::now();
-
-    while (!g_stop && !sessionClosed) {
-        while (offset < totalSamples) {
-            const size_t avail = ring.availableWrite();
-            if (avail < 2) break;
-            size_t chunk = std::min(avail, totalSamples - offset);
-            chunk -= chunk % 2;   // keep stereo-frame alignment
-            if (chunk == 0) break;
-            if (!ring.tryPush(std::span<const int16_t>(audio.pcm.data() + offset, chunk))) break;
-            offset += chunk;
+    // Stale cached credentials (the receiver reset its paired-device list):
+    // in interactive mode, clear the cache and re-pair with a PIN; headless
+    // mode fails immediately.
+    std::string creds = cachedCreds;
+    bool retriedWithoutCreds = false;
+    for (;;) {
+        switch (runSession(device, audio, o, headless, creds)) {
+        case SessionResult::Ok:
+        case SessionResult::Stopped:
+            return 0;
+        case SessionResult::Failed:
+            return 1;
+        case SessionResult::StaleCreds:
+            if (headless || retriedWithoutCreds) {
+                std::cerr << "error: cached credentials for '" << device.name
+                          << "' were rejected by the device (it may have reset its "
+                             "paired devices); "
+                          << (headless ? "run without --headless"
+                                       : "pair the device again and re-run")
+                          << " to re-pair with a PIN.\n";
+                return 1;
+            }
+            std::cout << "cached credentials were rejected by the device; "
+                         "re-pairing with a PIN...\n";
+            creds.clear();
+            retriedWithoutCreds = true;
+            break;   // retry once, un-paired, so the PIN prompt can re-authenticate
         }
-        if (offset >= totalSamples) fileQueued = true;
-
-        io.poll(16);
-
-        const auto now = std::chrono::steady_clock::now();
-        if (launchDone && launchedOk && now - lastProgress >= std::chrono::milliseconds(1000)) {
-            lastProgress = now;
-            const double queuedSec = double(offset / 2) / double(audio.sampleRate);
-            const double totalSec  = double(totalSamples / 2) / double(audio.sampleRate);
-            std::cout << "\r" << queuedSec << "s / " << totalSec << "s queued   " << std::flush;
-        }
-
-        if (fileQueued && !draining && launchDone && ring.availableRead() == 0) {
-            draining = true;
-            // RAOP's fixed pipeline latency is ~1.5 s (see raop_sender.h);
-            // give it a little extra margin so the last packets are
-            // actually audible at the receiver before TEARDOWN.
-            drainDeadline = now + std::chrono::milliseconds(2500);
-            std::cout << "\nfile fully queued, letting the tail play out...\n";
-        }
-        if (draining && now >= drainDeadline) break;
     }
-
-    std::cout << "\n";
-    if (g_stop) std::cout << "stopping (ctrl-c)...\n";
-    sender.stop();   // synchronous: TEARDOWN + socket close happen inline
-    std::cout << "done\n";
-    return (launchDone && !launchedOk) ? 1 : 0;
 }

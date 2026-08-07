@@ -76,7 +76,15 @@ add_executable(airplay-send
     example/wav_reader.cpp
     example/creds_store.cpp)
 target_link_libraries(airplay-send PRIVATE raop_sender posix_transport mdns_browser)
+target_compile_definitions(airplay-send PRIVATE
+    HEADLESS_DEFAULT=$<BOOL:${HEADLESS_DEFAULT}>)
 target_compile_features(airplay-send PRIVATE cxx_std_20)
+
+# --- headless default: how airplay-send responds when cached credentials are
+# stale (a receiver that reset its pairing). OFF = prompt for a PIN
+# re-authentication; ON = fail immediately. The CLI's --headless/--interactive
+# flags override it at runtime; --version reports the build-time value.
+option(HEADLESS_DEFAULT "Fail on stale cached credentials without prompting (overridable with --interactive)" OFF)
 
 # --- optional: miniaudio (decoding-only) for mp3/flac/ogg/opus support ---
 # Default OFF: the default build stays wav-only and dependency-free.
