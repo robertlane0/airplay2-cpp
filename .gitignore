@@ -4,6 +4,7 @@
 opusfile_config.h
 /build-ma/
 /build-off/
+/build-no/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
