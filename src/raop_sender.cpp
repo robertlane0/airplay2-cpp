@@ -347,8 +347,17 @@ void RaopSender::onHandshakeTimeout_() {
         // answering pair-verify when we present the now-stale stored
         // credentials; a verify-stage stall with cached creds in use counts
         // as a rejection so the caller can re-pair instead of hanging.
+        // Same for the encrypted control phase: some receivers (Roku TVs
+        // among them) still ANSWER pair-verify with a stored identity whose
+        // session keys they then won't honour, and go silent on the session
+        // SETUP / RECORD / stream SETUP. owntone treats a no-response to
+        // SETUP (session) exactly this way ("clearing pairing keys, you need
+        // to pair again"), so any post-verify control stall with cached
+        // creds in use also counts as a stale-credential rejection.
         if (!credsJson_.empty() &&
-            (pairStage_ == PairStage::VerifyM2 || pairStage_ == PairStage::VerifyDone))
+            (pairStage_ == PairStage::VerifyM2 || pairStage_ == PairStage::VerifyDone ||
+             pairStage_ == PairStage::Ap2Session || pairStage_ == PairStage::Ap2Record ||
+             pairStage_ == PairStage::Ap2Stream))
             credsRejected_ = true;
         // GET /info is a "required before SETUP" barrier whose body we never
         // use, but some non-Apple receivers (e.g. Roku TVs) simply never

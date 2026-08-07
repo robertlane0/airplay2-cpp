@@ -4,18 +4,20 @@
 - **stale credentials + AP2 handshake resilience in `airplay-send`.** No more
   hang on a receiver that won't finish the AirPlay 2 handshake. `RaopSender`
   reports a rejected pair-verify via `credsRejected()` (set when the receiver
-  refuses stored credentials, or stalls at the verify stage while cached creds
-  are in use). A new `HEADLESS_DEFAULT` CMake option (**OFF**, overridable at
-  runtime) decides the default: with the default build, stale credentials
-  trigger a fresh PIN re-authentication prompt; headless builds fail
-  immediately with a message. Two new flags, `--headless` and `--interactive`,
-  override the build default (last flag wins); `--help` annotates which flag
-  is the default / has no effect and `--version` prints the build-time
-  `HEADLESS_DEFAULT: ON/OFF`. And a receiver that accepts valid credentials
-  but never answers the post-pair-verify `GET /info` (some non-Apple devices,
-  e.g. Roku TVs) no longer stalls the whole session: after the handshake
-  timeout the sender skips `/info` (its body is unused) and proceeds to the
-  session SETUP.
+  refuses stored credentials, or stalls at the verify **or** the encrypted
+  session-SETUP/RECORD/stream phase while cached creds are in use). A new
+  `HEADLESS_DEFAULT` CMake option (**OFF**, overridable at runtime) decides
+  the default: with the default build, stale credentials trigger a fresh PIN
+  re-authentication prompt (clears the cache, re-pairs — owntone's own remedy
+  for a receiver that goes silent on `SETUP (session)` is to clear the pairing
+  keys and pair again); headless builds fail immediately with a message. Two
+  new flags, `--headless` and `--interactive`, override the build default
+  (last flag wins); `--help` annotates which flag is the default / has no
+  effect and `--version` prints the build-time `HEADLESS_DEFAULT: ON/OFF`.
+  And a receiver that accepts valid credentials but never answers the
+  post-pair-verify `GET /info` (some non-Apple devices, e.g. Roku TVs) no
+  longer stalls the whole session: after the handshake timeout the sender
+  skips `/info` (its body is unused) and proceeds to the session SETUP.
 - **miniaudio: the demo plays more than wav, optionally.** New
   `ENABLE_MINIAUDIO` CMake flag (default **OFF**; full plan in
   `MINIAUDIO_PLAN.md`). The flag build fetches miniaudio 0.11.25 (FetchContent,
