@@ -100,6 +100,10 @@ public:
     void setAuth(Auth auth, bool airplay2, const std::string& deviceId,
                 const std::string& credsJson, const std::string& password);
 
+    // Name this sender presents to the receiver (X-Apple-Client-Name header
+    // + the AP2 SETUP "name" field). Defaults to "FXChainPlayer".
+    void setClientName(const std::string& name);
+
     // Connect + handshake + stream. One session at a time. `host` is a
     // numeric IPv4 address (as from mDNS resolution upstream) -- it is used
     // both for the TCP control connection AND for every UDP sendTo(), so a
@@ -281,6 +285,7 @@ private:
     uint32_t    activeRemote_ = 0;
     std::string rtspSession_;             // Session: header from SETUP
     std::string host_, name_;
+    std::string clientName_;
     State       state_ = State::Idle;
 
     // #90, AP2 event channel: a modern Apple TV requires an (encrypted) TCP

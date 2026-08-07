@@ -70,6 +70,17 @@ std::string trimmed(std::string s) {
     return s.substr(b, e - b + 1);
 }
 
+// The binary's own name minus any leading path and trailing extension -- the
+// default client name, so renaming the executable renames the sender.
+std::string executableBaseName(const char* argv0) {
+    std::string base = argv0 ? argv0 : "";
+    const size_t slash = base.find_last_of("/\\");
+    if (slash != std::string::npos) base = base.substr(slash + 1);
+    const size_t dot = base.find_last_of('.');
+    if (dot != std::string::npos && dot > 0) base = base.substr(0, dot);
+    return base.empty() ? "airplay-send" : base;
+}
+
 // std::stoi/std::stod throw on anything that isn't a valid number, which
 // would otherwise crash the program on a simple typo'd flag value; these
 // return false instead so callers can print a clean usage error.
@@ -113,6 +124,9 @@ struct Options {
     bool        version = false;
     bool        help = false;
     std::string wavPath;
+    // Name this sender presents to the receiver (X-Apple-Client-Name). Empty
+    // = the executable's own basename (renaming the binary renames it).
+    std::string clientName;
 };
 
 void printUsage(const char* argv0) {
@@ -138,6 +152,9 @@ void printUsage(const char* argv0) {
         "                       overrides whatever discovery found for --host)\n"
         "  --airplay1           force legacy AirPlay 1 (no HAP pairing)\n"
         "  --password <pw>      RTSP digest password (AirPlay 1 pw=true receivers)\n"
+        "  --name <name>        name presented to the receiver as the sender\n"
+        "                       (default: this executable's file name, minus any\n"
+        "                       extension)\n"
         "  --volume <0-100>     percent volume once streaming starts (default: leave untouched)\n"
         "  --browse-time <sec>  seconds to browse mDNS for (default: 3)\n"
         "  --no-discover        skip mDNS entirely (requires --host)\n"
@@ -192,6 +209,7 @@ bool parseArgs(int argc, char** argv, Options& o) {
         }
         else if (a == "--airplay1") { o.airplay1 = true; }
         else if (a == "--password") { auto v = need("--password"); if (!v) return false; o.password = *v; }
+        else if (a == "--name") { auto v = need("--name"); if (!v) return false; o.clientName = *v; }
         else if (a == "--volume") {
             auto v = need("--volume"); if (!v) return false;
             double vol = 0.0;
@@ -363,6 +381,7 @@ SessionResult runSession(const RaopDeviceInfo& device, const AudioData& audio,
     };
 
     sender.setAuth(device.auth, device.airplay2, device.deviceId, credsJson, o.password);
+    sender.setClientName(o.clientName);
     sender.start(device.host, device.port, device.name);
 
     size_t offset = 0;
@@ -423,6 +442,7 @@ int main(int argc, char** argv) {
     if (!parseArgs(argc, argv, o)) { printUsage(argv[0]); return 2; }
     if (o.help) { printUsage(argv[0]); return 0; }
     if (o.version) { printVersion(); return 0; }
+    if (o.clientName.empty()) o.clientName = executableBaseName(argv[0]);
 
     std::vector<RaopDeviceInfo> found;
     if (!o.noDiscover) {

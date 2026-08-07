@@ -30,6 +30,7 @@ airplay-send living_room.wav                          # discover, pick a receive
 airplay-send --host 10.0.0.42 song.mp3                 # with -DENABLE_MINIAUDIO=ON
 airplay-send --host 10.0.0.42 --airplay1 song.wav      # legacy RAOP, no HAP pairing
 airplay-send --host 10.0.0.42 --password secret song.wav  # pw=true legacy receivers
+airplay-send --name "Party Box" living_room.wav        # override the sender name
 airplay-send --list                                    # just show what's on the LAN
 airplay-send --help                                    # the full flag list
 ```
@@ -40,6 +41,10 @@ prompts right there on stdin), streams the file, and tears down cleanly on
 ctrl-c or when the file ends. A successful pairing is cached under
 `~/.cache/airplay-send/` (or `$XDG_CACHE_HOME`) so the next run against the
 same device skips the PIN.
+
+the name that reaches the receiver (`X-Apple-Client-Name` + the AP2 SETUP
+"name" field) defaults to the executable's own file name -- rename the binary
+and the sender renames itself -- or is set explicitly with `--name <name>`.
 
 ## input formats
 

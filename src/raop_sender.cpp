@@ -306,6 +306,7 @@ struct RaopAp2State {
 RaopSender::RaopSender(ITransport& transport) : transport_(transport) {
     backlog_.resize(kBacklogSize);
     backlogSeq_.assign(kBacklogSize, -1);
+    clientName_ = "FXChainPlayer";
 }
 
 RaopSender::~RaopSender() {
@@ -428,6 +429,10 @@ void RaopSender::setAuth(Auth auth, bool airplay2, const std::string& deviceId,
     deviceId_       = deviceId;
     credsJson_      = credsJson;
     digestPassword_ = password;
+}
+
+void RaopSender::setClientName(const std::string& name) {
+    clientName_ = name.empty() ? std::string("FXChainPlayer") : name;
 }
 
 // pyatv timing.ntp_now(): microsecond wall clock in 64-bit NTP format
@@ -685,7 +690,7 @@ void RaopSender::sendRequest_(const std::string& method, const std::string& uri,
     req += "DACP-ID: " + dacpId_ + "\r\n";
     req += "Active-Remote: " + std::to_string(activeRemote_) + "\r\n";
     req += "Client-Instance: " + dacpId_ + "\r\n";
-    req += "X-Apple-Client-Name: FXChainPlayer\r\n";   // AirPlay-bug fix, owntone parity
+    req += "X-Apple-Client-Name: " + clientName_ + "\r\n";   // AirPlay-bug fix, owntone parity
     // v0.66.x, RTSP digest auth for pw=true receivers: once a 401 has
     // told us realm+nonce, every subsequent request carries Authorization.
     if (!digestNonce_.empty() && !digestPassword_.empty()) {
@@ -1174,7 +1179,7 @@ void RaopSender::httpPost_(const std::string& uri, const std::string& contentTyp
     // identity headers before the TLV, and their absence is a documented
     // 403 cause. Mirror owntone (Client-Instance == DACP-ID value).
     req += "Client-Instance: " + dacpId_ + "\r\n";
-    req += "X-Apple-Client-Name: FXChainPlayer\r\n";
+    req += "X-Apple-Client-Name: " + clientName_ + "\r\n";
     if (!contentType.empty())
         req += "Content-Type: " + contentType + "\r\n";
     req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
@@ -1694,7 +1699,7 @@ void RaopSender::sendAp2Rtsp_(const std::string& method, const std::string& uri,
     req += "DACP-ID: " + dacpId_ + "\r\n";
     req += "Active-Remote: " + std::to_string(activeRemote_) + "\r\n";
     req += "Client-Instance: " + dacpId_ + "\r\n";
-    req += "X-Apple-Client-Name: FXChainPlayer\r\n";
+    req += "X-Apple-Client-Name: " + clientName_ + "\r\n";
     if (method == "SETUP")
         req += "X-Apple-StreamID: 1\r\n";        // owntone/pyatv parity
     if (!contentType.empty())
@@ -1727,7 +1732,7 @@ void RaopSender::sendAp2SetupSession_() {
     d.emplace_back("groupContainsGroupLeader", Value::boolean(false));
     d.emplace_back("macAddress", Value::str("AA:BB:CC:DD:EE:FF"));
     d.emplace_back("model", Value::str("iPhone14,3"));
-    d.emplace_back("name", Value::str("FXChainPlayer"));
+    d.emplace_back("name", Value::str(clientName_));
     d.emplace_back("osBuildVersion", Value::str("20F66"));
     d.emplace_back("osName", Value::str("iPhone OS"));
     d.emplace_back("osVersion", Value::str("16.5"));
