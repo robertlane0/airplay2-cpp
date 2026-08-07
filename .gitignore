@@ -1,6 +1,7 @@
 # build
 /build/
 /_deps/
+opusfile_config.h
 /build-ma/
 /build-off/
 CMakeCache.txt
