@@ -350,6 +350,21 @@ void RaopSender::onHandshakeTimeout_() {
         if (!credsJson_.empty() &&
             (pairStage_ == PairStage::VerifyM2 || pairStage_ == PairStage::VerifyDone))
             credsRejected_ = true;
+        // GET /info is a "required before SETUP" barrier whose body we never
+        // use, but some non-Apple receivers (e.g. Roku TVs) simply never
+        // answer it on the encrypted control channel. Treat that silence the
+        // same way a 200 reply would be: drop the pending request and go
+        // straight to the session SETUP, which carries all the receiver
+        // actually needs.
+        if (state_ == State::Handshake && pairStage_ == PairStage::Ap2Info
+            && !pendingMethods_.empty()) {
+            Log::warn("Cast: AirPlay 2 GET /info not answered ({}ms), skipping it "
+                      "and continuing to session SETUP", kHandshakeTimeoutMs);
+            pendingMethods_.erase(pendingMethods_.begin());
+            if (!pendingIsHttp_.empty()) pendingIsHttp_.erase(pendingIsHttp_.begin());
+            sendAp2SetupSession_();
+            return;
+        }
         fail_("Timed out waiting for the device");
     }
 }
