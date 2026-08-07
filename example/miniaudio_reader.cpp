@@ -7,6 +7,7 @@
 
 #include "miniaudio_reader.h"
 #include "miniaudio.h"
+#include "extras/decoders/libopus/miniaudio_libopus.h"
 
 namespace fxchain {
 
@@ -24,7 +25,14 @@ AudioData loadWithMiniAudio(const std::string& path) {
 
     // Ask miniaudio to convert to interleaved s16 stereo at the file's
     // native sample rate (0 = don't resample; RaopSender does that).
+    //
+    // Register miniaudio's libopus decoding backend so Ogg Opus files (which the
+    // stock build can't touch -- its Ogg support is Vorbis-only via stb_vorbis)
+    // decode through libopusfile. See CMakeLists.txt under ENABLE_MINIAUDIO.
+    ma_decoding_backend_vtable* opusBackends[] = { ma_decoding_backend_libopus };
     ma_decoder_config cfg = ma_decoder_config_init(ma_format_s16, 2, 0);
+    cfg.ppCustomBackendVTables = opusBackends;
+    cfg.customBackendCount = 1;
     ma_decoder d;
     if (ma_decoder_init_file(path.c_str(), &cfg, &d) != MA_SUCCESS) {
         out.error = "could not decode '" + path + "' (miniaudio)";

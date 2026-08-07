@@ -118,7 +118,74 @@ if(ENABLE_MINIAUDIO)
     )
 
     target_sources(airplay-send PRIVATE example/miniaudio_reader.cpp)
-    target_link_libraries(airplay-send PRIVATE miniaudio)
     target_compile_definitions(airplay-send PRIVATE WITH_MINIAUDIO)
+
+    # --- Opus decode support: two pieces miniaudio leaves external ---
+    # miniaudio has NO built-in Opus decoder; Ogg support in the stock build is
+    # Vorbis-only (stb_vorbis). The reference way to decode Ogg Opus with
+    # miniaudio is the extra "libopus" decoding backend in
+    # extras/decoders/libopus/, which sits on top of xiph's libopus + libopusfile.
+    # Wire both in so .opus streams actually decode.
+
+    # libopusfile (xiph/opusfile) only ships an autotools build in the v0.12
+    # release -- no CMakeLists.txt, and the CMakeLists on 'master' requires a
+    # system Opus CMake config that isn't available here. So consume the tagged
+    # sources directly and compile the four codec translation units ourselves,
+    # which means populating without add_subdirectory().
+    if(POLICY CMP0169)
+        cmake_policy(SET CMP0169 OLD)
+    endif()
+    FetchContent_Declare(opusfile
+        GIT_REPOSITORY https://github.com/xiph/opusfile.git
+        GIT_TAG        v0.12
+        GIT_SHALLOW    TRUE
+        SYSTEM
+    )
+    FetchContent_GetProperties(opusfile)
+    if(NOT opusfile_POPULATED)
+        FetchContent_Populate(opusfile)
+    endif()
+
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(OPUSFILE_DEPS REQUIRED opus ogg)
+
+    # config.h is normally produced by autotools' configure step; opusfile's
+    # sources include it and only read OP_HAVE_LRINTF (float rounding on glibc).
+    file(WRITE "${CMAKE_BINARY_DIR}/opusfile_config.h"
+        "#ifndef OP_CONFIG_H\n"
+        "#define OP_CONFIG_H\n"
+        "#define OP_HAVE_LRINTF 1\n"
+        "#endif\n"
+    )
+
+    add_library(opencode_opusfile STATIC
+        "${opusfile_SOURCE_DIR}/src/opusfile.c"
+        "${opusfile_SOURCE_DIR}/src/info.c"
+        "${opusfile_SOURCE_DIR}/src/stream.c"
+        "${opusfile_SOURCE_DIR}/src/internal.c"
+    )
+    target_include_directories(opencode_opusfile PUBLIC
+        "${opusfile_SOURCE_DIR}/include"
+        ${OPUSFILE_DEPS_INCLUDE_DIRS}
+    )
+    target_include_directories(opencode_opusfile PRIVATE
+        "${CMAKE_BINARY_DIR}"
+    )
+    target_link_libraries(opencode_opusfile PUBLIC
+        ${OPUSFILE_DEPS_LIBRARIES}
+        m
+    )
+
+    # The miniaudio "libopus" decoding backend: registerable via
+    # ma_decoding_backend_libopus. Compiled as its own TU so it only pulls the
+    # ma_* symbols it needs out of libminiaudio at final link, matching how
+    # miniaudio itself builds extras/decoders today.
+    add_library(opencode_ma_opus STATIC
+        "${miniaudio_SOURCE_DIR}/extras/decoders/libopus/miniaudio_libopus.c"
+    )
+    target_include_directories(opencode_ma_opus PRIVATE "${miniaudio_SOURCE_DIR}")
+    target_link_libraries(opencode_ma_opus PUBLIC opencode_opusfile)
+
+    target_link_libraries(airplay-send PRIVATE miniaudio opencode_ma_opus opencode_opusfile)
 endif()
 
