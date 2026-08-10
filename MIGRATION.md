@@ -14,7 +14,7 @@ order. States: `Not assessed` → `Assessed` → `Characterized` →
 | (header) `transport.h`  | `transport`              | `crates/transport`           | Rust impl validated |
 | `posix_transport`       | `posix-transport`        | `crates/posix-transport`     | Rust impl validated |
 | `airplay_crypto`        | `airplay-crypto`         | `crates/airplay-crypto`      | Characterized + Rust impl validated * |
-| `mdns_browser`          | `mdns-browser`           | `crates/mdns-browser`        | Not assessed |
+| `mdns_browser`          | `mdns-browser`           | `crates/mdns-browser`        | Characterized + Rust impl validated * |
 | `raop_sender`           | `raop-sender`            | `crates/raop-sender`         | Not assessed |
 | `airplay-send` (example)| `airplay-send`           | `crates/airplay-send`        | Not assessed |
 | `mbedcrypto` + ed25519  | RustCrypto crates + dalek| (workspace dependencies)     | Not assessed |
@@ -175,7 +175,43 @@ multi-record resolution path.
 - **API parity.** `tlv`, `bplist`, `srp` exposed as `pub mod`s, matching the
   C++ header's public namespaces; `BplistValue`/`SrpClient` re-exported.
 
-### mdns-browser / raop-sender / airplay-send — pending assessment.
+### mdns-browser (`src/mdns_browser.{h,cpp}` → `crates/mdns-browser`) — Characterized + Rust impl validated
+
+- **Scope.** mDNS/DNS-SD receiver discovery: one UDP socket on
+  `224.0.0.251:5353` (SO_REUSEADDR + SO_REUSEPORT, multicast TTL 255,
+  nonblocking), two-question PTR query (`_airplay._tcp.local` +
+  `_raop._tcp.local`), per-packet `PTR → SRV/TXT/A` correlation, friendly-name
+  dedupe with silent host/port/txt refresh on re-announcement and a re-fire on
+  AirPlay 1 → AirPlay 2 upgrade, `deriveAuth` (AP2 → HapPin; `pw` ∈
+  {true,1} → Password; `am` prefix "AirPort" → AuthSetup; else None).
+- **Parser semantics ported byte-for-byte from the C++ `DnsReader`** (all
+  adversarial behavior unit-tested): name compression pointers must point
+  strictly backward, ≤ 128 hops, ≤ 1024-byte names, reserved 01/10 label
+  prefixes and truncated names are malformed, question section skipped, all
+  three RR sections merged in packet order, `rdlength`-bounded rdata, TXT
+  first-wins per key (C++ `emplace`/`std::map::insert` — Rust uses
+  `BTreeMap::entry().or_insert()`), SRV port = rdata bytes 4–5 BE, A record
+  must be `rdlength == 4` and in the same packet, cache-flush class bit
+  masked, records already parsed before a malformed tail are still delivered.
+- **Documented deviations.** `new() -> Result<MdnsBrowser, MdnsBrowserError>`
+  instead of a half-constructed object + `ok()`; `SOCK_NONBLOCK` +
+  `SOCK_CLOEXEC` passed to `socket(2)` (matching posix-transport) instead of a
+  later `fcntl(O_NONBLOCK)`; `handle_packet` is public (C++ `handlePacket_`
+  was private) so tests and callers can drive parsing without a socket.
+- **`Auth` enum** mirrors `fxchain::RaopSender::Auth` (None, AuthSetup,
+  LegacyPin, HapTransient, HapPin, Password) for `airplay-send` to consume.
+- **Tests.** 25 unit tests: exact query-packet bytes, discovery + auth
+  derivation, refresh-without-refire, upgrade re-fire, two devices in one
+  packet in order, A-rdlength / missing-SRV skip rules, question-section
+  skipping, TXT truncation soft-stop and first-wins merge, unknown
+  service/instance isolation, malformed-input fuzzlets, pointer chain 128-hop
+  cap, forward/self pointers, reserved prefixes, 1024-byte name cap, bounds
+  checks. Live socket path (`new`/`query`/`poll`) verified on a dev box via an
+  `#[ignore]`d smoke test (binds port 5353; excluded from default CI runs).
+- **Owner.** conversation; **Exit criteria.** end-to-end discovery order in
+  the `airplay-send` demo matches the C++ binary.
+
+### raop-sender / airplay-send — pending assessment.
 
 ## CI quality gates (to be established)
 

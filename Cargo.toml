@@ -6,6 +6,7 @@ members = [
     "crates/transport",
     "crates/posix-transport",
     "crates/airplay-crypto",
+    "crates/mdns-browser",
 ]
 
 [workspace.dependencies]

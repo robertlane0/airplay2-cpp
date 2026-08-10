@@ -1,0 +1,13 @@
+[package]
+name = "mdns-browser"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "mDNS/DNS-SD browser for AirPlay receivers (migration of src/mdns_browser.{h,cpp})"
+
+[dependencies]
+nix = { workspace = true }
+
+[lints]
+workspace = true
