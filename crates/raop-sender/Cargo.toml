@@ -1,0 +1,13 @@
+[package]
+name = "raop-sender"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "AirPlay RAOP sender protocol layer: RTSP/HTTP wire, HAP pairing, AP2 plists (migration of src/raop_sender.{h,cpp})"
+
+[dependencies]
+airplay-crypto = { path = "../airplay-crypto" }
+
+[lints]
+workspace = true
