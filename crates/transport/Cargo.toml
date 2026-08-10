@@ -1,0 +1,10 @@
+[package]
+name = "transport"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The Qt-free network + timer abstraction (migration of src/transport.h)"
+
+[lints]
+workspace = true

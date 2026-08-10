@@ -18,6 +18,9 @@ Makefile
 *.exp
 *.wav
 airplay-send
+# rust
+/target/
+Cargo.lock
 # ide
 .vs/
 .vscode/

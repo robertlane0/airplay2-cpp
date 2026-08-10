@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/logger",
+    "crates/ring-buffer",
+    "crates/transport",
+    "crates/posix-transport",
+]
+
+[workspace.dependencies]
+nix = { version = "0.29", features = ["poll", "socket", "net"] }
+transport = { path = "crates/transport" }
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+# Rust 2024, no unsafe anywhere in the workspace (AGENTS.md non-negotiable #1).
+[workspace.lints.rust]
+unsafe_code = "deny"
