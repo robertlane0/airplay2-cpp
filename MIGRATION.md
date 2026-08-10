@@ -12,8 +12,8 @@ order. States: `Not assessed` → `Assessed` → `Characterized` →
 | (header) `logger.h`     | `logger`                 | `crates/logger`              | Rust impl validated |
 | (header) `ring_buffer.h`| `ring-buffer`            | `crates/ring-buffer`         | Rust impl validated |
 | (header) `transport.h`  | `transport`              | `crates/transport`           | Rust impl validated |
-| `posix_transport`       | `posix-transport`        | `crates/posix-transport`     | Rust impl started |
-| `airplay_crypto`        | `airplay-crypto`         | `crates/airplay-crypto`      | Not assessed |
+| `posix_transport`       | `posix-transport`        | `crates/posix-transport`     | Rust impl validated |
+| `airplay_crypto`        | `airplay-crypto`         | `crates/airplay-crypto`      | Characterized + Rust impl validated * |
 | `mdns_browser`          | `mdns-browser`           | `crates/mdns-browser`        | Not assessed |
 | `raop_sender`           | `raop-sender`            | `crates/raop-sender`         | Not assessed |
 | `airplay-send` (example)| `airplay-send`           | `crates/airplay-send`        | Not assessed |
@@ -70,6 +70,23 @@ All three crates pass `cargo check --all-targets`, `cargo test` (4+9+3
 tests incl. a 50k-op model check against `VecDeque` for the ring), `cargo
 clippy -- -D warnings`, `cargo fmt --check`, and build docs. No `unsafe`
 (workspace lint `unsafe_code = "deny"`).
+
+### posix-transport — Rust impl validated (2026-08-11)
+
+`crates/posix-transport` (845+ lines, 10 tests) passes the full gate
+suite: `cargo check --all-targets`, `cargo test -p posix-transport`
+(incl. deferred connected-callback, connect-failure, UDP send/receive
+round-trips, timer clamp/reschedule/cancel, re-entrancy from callbacks,
+and `close()` from inside a callback), `cargo clippy -- -D warnings`,
+`cargo fmt --check`.
+
+Bug fixed during validation: `tcp_connect` previously connected to
+`addrs[0]` instead of the address record whose `socket()` succeeded
+(C++ `used->ai_addr` parity at `src/posix_transport.cpp:86`). On an
+IPv6-first resolution with IPv6 unavailable the old code returned `None`
+where the C++ fell through to IPv4. Fixed by tracking the winning record;
+regression test `tcp_connect_resolves_multihomed_hostname` covers the
+multi-record resolution path.
 
 ## Per-component records
 
@@ -129,11 +146,34 @@ clippy -- -D warnings`, `cargo fmt --check`, and build docs. No `unsafe`
   `poll(nullptr, 0, t)` sleep when no sockets.
 - **Deps:** `nix` (poll, sockets, multicast needs in mdns-browser).
 
-### airplay-crypto (pending: read `airplay_crypto.cpp`)
+### airplay-crypto (`src/airplay_crypto.cpp` → `crates/airplay-crypto`) — Characterized + Rust impl validated
 
-- bplist/TLV8 wire formats, SRP-6a 3072/SHA-512 client, ChaCha20-Poly1305
-  (8-byte LE counter nonce + 4-zero pad), HKDF-SHA512 (32-byte keys),
-  X25519, Ed25519, sha512/hmacSha512, randomBytes, RFC 2617 digest auth.
+- **Scope.** bplist/TLV8 wire formats, SRP-6a 3072/SHA-512 client,
+  ChaCha20-Poly1305 (8-byte LE counter nonce + 4-zero pad), HKDF-SHA512
+  (32-byte keys), X25519, Ed25519, sha512/hmacSha512, randomBytes, RFC 2617
+  digest auth.
+- **Differential validation (2026-08-10).** Deterministic C++ reference
+  harness at `crates/airplay-crypto/testdata/cxx-ref-harness.cpp` (rebuild
+  + golden refresh from the repo root: `sh crates/airplay-crypto/testdata/build-cxx-ref-harness.sh`).
+  `crates/airplay-crypto/testdata/cxx-ref-golden.txt` captured 28 lines of
+  ground truth (sha512/hmac/hkdf/ChaCha-Poly1305 ciphertext, X25519
+  RFC 7748 §6.1 incl. clamping + low-order rejection, Ed25519 RFC 8032
+  vector 1 + message signature, TLV8 incl. 384-byte fragmentation and
+  truncation behavior, bplist full setup-features dict byte-exact,
+  digest-auth header layout). The Rust tests mirror every value
+  (`tests::cxx_reference_harness_goldens`). During validation the C++
+  vendored X25519 (`third_party/ed25519/src/x25519_raw.c`) was swept
+  against an independent Python Montgomery ladder (41 cases incl. the RFC
+  vector): VENDORED C++ IS CORRECT — no incompatibility to document. A
+  mis-typed test vector in the original Rust `hkdf_sha512_rfc5869_case4`
+  golden constant was found and fixed (independent Python HKDF + C++
+  agree with the implementation).
+- **Behavioral notes.** `chacha20Poly1305Decrypt` returns `None` on bad
+  key/tag/AAD (C++ `nullopt`); X25519 all-zero/low-order shared secret →
+  `None`; SRP ephemeral `a` uses `getrandom` (C++ Mbed TLS CTR-DRBG —
+  same-class OS randomness, documented decision above).
+- **API parity.** `tlv`, `bplist`, `srp` exposed as `pub mod`s, matching the
+  C++ header's public namespaces; `BplistValue`/`SrpClient` re-exported.
 
 ### mdns-browser / raop-sender / airplay-send — pending assessment.
 

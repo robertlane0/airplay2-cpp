@@ -5,6 +5,7 @@ members = [
     "crates/ring-buffer",
     "crates/transport",
     "crates/posix-transport",
+    "crates/airplay-crypto",
 ]
 
 [workspace.dependencies]

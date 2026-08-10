@@ -258,9 +258,11 @@ impl Transport for PosixTransport {
         if addrs.is_empty() {
             return None;
         }
-        // C++ behavior: use the first address whose socket() call succeeds;
-        // a hard connect() error on it fails the whole call.
+        // C++ behavior: use the first address whose socket() call succeeds,
+        // then connect() to THAT address record (C++: `used->ai_addr`); a
+        // hard connect() error on it fails the whole call.
         let mut fd: Option<std::os::fd::OwnedFd> = None;
+        let mut used: Option<SockaddrStorage> = None;
         for addr in &addrs {
             let (family, socktype, proto) = match addr {
                 SocketAddr::V4(_) => (
@@ -281,13 +283,14 @@ impl Transport for PosixTransport {
                 proto,
             ) {
                 fd = Some(s);
+                used = Some(SockaddrStorage::from(*addr));
                 break;
             }
         }
         let fd = fd?;
         let _ = nixsock::setsockopt(&fd, nix::sys::socket::sockopt::TcpNoDelay, &true);
 
-        let sockaddr: SockaddrStorage = SockaddrStorage::from(addrs[0]);
+        let sockaddr = used.expect("sockaddr is set together with the fd");
         loop {
             match nixsock::connect(fd.as_raw_fd(), &sockaddr) {
                 Ok(()) => break,
@@ -626,6 +629,62 @@ mod tests {
         drop(stream);
         assert!(pump_until(&t, || closed.get(), 50));
         assert!(!t.send(h, b"x"));
+    }
+
+    #[test]
+    fn tcp_connect_resolves_multihomed_hostname() {
+        use std::net::{Ipv6Addr, SocketAddrV6, TcpListener as StdTcpListener, ToSocketAddrs};
+        // "localhost" often resolves to both ::1 and 127.0.0.1. The
+        // connect target must be the address record whose socket()
+        // succeeded (C++ `used->ai_addr` parity) — never blindly addrs[0]
+        // — or an IPv6-first resolution with IPv6 unavailable would fail
+        // where the C++ fell through to IPv4.
+        //
+        // Pick the listener the same way the transport picks its target:
+        // the first record in resolution order, falling back to IPv4 only
+        // when an IPv6 socket cannot be created at all.
+        let listener = match StdTcpListener::bind(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0)) {
+            Ok(l) => l, // order of preference: more coercion paths
+            Err(_) => StdTcpListener::bind(("127.0.0.1", 0)).unwrap(),
+        };
+        let port = listener.local_addr().unwrap().port();
+        // In the resolution order the transport will see (not sorted).
+        let first = ("localhost", port)
+            .to_socket_addrs()
+            .unwrap()
+            .next()
+            .unwrap();
+        // Skip only the case where we are listening on ::1 but the
+        // resolver's first record is IPv4: the transport would connect to
+        // 127.0.0.1 (nothing listening there -> confused test). Every other
+        // combination ends with the transport on the right listener: a V4
+        // listener is correct both when IPv4 is the first record and when
+        // IPv6 sockets fail after an IPv6-first resolution (the fall-through
+        // this test guards).
+        let listener_is_v6 = matches!(listener.local_addr().unwrap(), std::net::SocketAddr::V6(..));
+        let first_is_v4 = matches!(first, std::net::SocketAddr::V4(..));
+        if listener_is_v6 && first_is_v4 {
+            return;
+        }
+        let t = PosixTransport::new();
+        let connected = Rc::new(Cell::new(false));
+        let closed = Rc::new(Cell::new(false));
+        let (c, cl) = (connected.clone(), closed.clone());
+        let h = t
+            .tcp_connect(
+                "localhost",
+                port,
+                Box::new(move || c.set(true)),
+                Box::new(|_, _, _| {}),
+                Box::new(move |_| cl.set(true)),
+            )
+            .expect("connect accepted");
+        assert!(
+            pump_until(&t, || connected.get() || closed.get(), 50),
+            "connect completed (on_connected) or was refused (on_closed)"
+        );
+        assert!(connected.get(), "expected a live connection, got on_closed");
+        let _ = h;
     }
 
     #[test]
