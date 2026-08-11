@@ -17,7 +17,11 @@
 //! * [`pairing`] — HAP pair-setup M1..M6 + pair-verify M1..M3 as a pure
 //!   state container (`PairingSession`), creds-JSON handling;
 //! * [`plists`] — the AP2 binary-plist session/stream SETUP payloads and
-//!   reply parsing.
+//!   reply parsing;
+//! * [`stream`] — the RAOP UDP packet layer: RTP audio packets (AP1
+//!   big-endian s16 / AP2 uncompressed-ALAC + ChaCha20-Poly1305), the
+//!   SYNC packet (0x54), retransmit handling (0x55 → 0xD6) and the NTP
+//!   timing reply (0xD3).
 //!
 //! The sender state machine (the `RaopSender` struct over the
 //! `transport` trait), the audio path (pacers, resampler, ALAC encoder,
@@ -29,10 +33,12 @@
 //! * Errors are `Result`-typed; the C++ fails the session with a message.
 //!   Each error variant maps back to exactly one C++ `fail_` string so
 //!   the state machine can reproduce the diagnostics.
-//! * The inbound AP2 frame-length is capped at 1 MiB
+//! * The inbound AP2 frame-length is capped at 32 KiB
 //!   ([`rtsp::FrameError::OversizedFrame`]); the C++ has no such cap and
 //!   would grow its encrypted accumulator unboundedly against a hostile
-//!   length prefix.
+//!   length prefix (an LE16-encoded length can reach at most 65535, so
+//!   32 KiB is the tightest power-of-two ceiling that keeps the cap
+//!   reachable in practice).
 //! * RNG failures (`util::rand_*`, `make_uuid`) propagate as
 //!   `Result` instead of panicking.
 //! * Some panic-free hardening where the C++ relies on
@@ -41,6 +47,7 @@
 pub mod pairing;
 pub mod plists;
 pub mod rtsp;
+pub mod stream;
 pub mod util;
 
 pub use pairing::{PairingError, PairingMode, PairingSession, StoredCreds};

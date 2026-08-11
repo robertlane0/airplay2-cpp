@@ -15,7 +15,7 @@ order. States: `Not assessed` → `Assessed` → `Characterized` →
 | `posix_transport`       | `posix-transport`        | `crates/posix-transport`     | Rust impl validated |
 | `airplay_crypto`        | `airplay-crypto`         | `crates/airplay-crypto`      | Characterized + Rust impl validated * |
 | `mdns_browser`          | `mdns-browser`           | `crates/mdns-browser`        | Characterized + Rust impl validated * |
-| `raop_sender`           | `raop-sender`            | `crates/raop-sender`         | Not assessed |
+| `raop_sender`           | `raop-sender`            | `crates/raop-sender`         | Characterized + Rust impl started * |
 | `airplay-send` (example)| `airplay-send`           | `crates/airplay-send`        | Not assessed |
 | `mbedcrypto` + ed25519  | RustCrypto crates + dalek| (workspace dependencies)     | Not assessed |
 
@@ -211,7 +211,49 @@ multi-record resolution path.
 - **Owner.** conversation; **Exit criteria.** end-to-end discovery order in
   the `airplay-send` demo matches the C++ binary.
 
-### raop-sender / airplay-send — pending assessment.
+### raop-sender (`src/raop_sender.{h,cpp}` → `crates/raop-sender`) — Characterized + Rust impl started
+
+- **Scope.** 2073-line state machine. The pure, device-free layers are
+  ported and validated: `util` (NTP/RTP timeline math, hex/JSON/DMAP
+  helpers, session constants), `rtsp` (response parsing `onRtspData_`,
+  request builders `sendRequest_`/`sendAp2Rtsp_`/`httpPost_`/feedback,
+  digest challenges, the AP2 ChaCha20-Poly1305 channel
+  `writeRtsp_`/`onEventData_` incl. the encrypted-200-OK event responder,
+  and the handshake payloads SDP/volume/transport/RTP-Info/DMAP
+  metadata), `pairing` (pair-setup M1..M6 + pair-verify M1..M3 as
+  `PairingSession`, creds-JSON), `plists` (AP2 SETUP session/stream
+  payloads + reply parsing), and `stream` (RTP audio packets: AP1 BE s16
+  / AP2 uncompressed-ALAC + ChaCha20-Poly1305 with trailing nonce, SYNC
+  0x54, retransmit 0x55 → 0xD6, NTP timing reply 0xD3, 1024-slot
+  backlog).
+- **Session work (2026-08-10).** RTSP channel unit fixes: `MAX_FRAME_LEN`
+  tightened 1 MiB → 32 KiB (an LE16 length prefix caps hostile frames at
+  65535, making a 1 MiB ceiling unreachable; 32 KiB is the tightest
+  enforceable power-of-two bound, documented deviation), `M4Outcome`
+  moved to module scope, `PairingMode` derives `Default`, M1 test
+  corrected against `sendPairSetupM1_` (Method=0, **State=1**,
+  transient Flags=0x10), split/batched channel tests fixed (were
+  replaying an already-decrypted frame — a real counter desync),
+  `build_rtsp_request` refactored to an `RtspRequest` struct (clippy
+  `too_many_arguments`).
+- **`stream` module (2026-08-10).** 14 tests: ALAC bit-level goldens
+  verified against an independent Python bit-writer (header 0x20 0x00
+  0x02, samples continuous from bit 23, END tail 0x01 0xC0), RTP header
+  golden (marker on first packet, seq/rtptime advance), AP1 BE-s16
+  payload, AP2 AEAD roundtrip with AAD = header 4..12 and trailing LE
+  nonce + counter advance, SYNC packet golden with hand-computed
+  ts2ntp/rtptime fields, retransmit replay order + aged-out-slot skip,
+  timing-reply golden + short-datagram rejection. Cross-checked against
+  `sendAudioPacket_`/`sendSyncPacket_`/`onControlData_`/
+  `onTimingData_`/`encodeAlacFrame_` (src/raop_sender.cpp:1825, 2006,
+  2027, 2051, 1867).
+- **Remaining.** The `RaopSender` state machine over the `transport`
+  trait (session flow, pacer token bucket, resampler, ring input),
+  mock-transport integration tests, then the `airplay-send` example /
+  C++ removal.
+- **Owner.** conversation.
+
+### airplay-send (`crates/airplay-send`) — pending assessment.
 
 ## CI quality gates (to be established)
 
