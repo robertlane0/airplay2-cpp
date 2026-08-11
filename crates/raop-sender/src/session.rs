@@ -21,7 +21,7 @@
 //!   pin-start→transient fallbacks), the AP2 flow (`GET /info` →
 //!   session SETUP → event channel + RECORD → stream SETUP →
 //!   streaming), `startStreaming_` (timeline anchor, 1 s sync, 8 ms
-//!   pacer, 2 s AP2 / 25 s AP1 feedback, 0 dB AP2 default volume), the
+//!   pacer, 2 s AP2 / 25 s AP1 feedback), the
 //!   encrypted control + event channels, volume/metadata push, and the
 //!   retransmit/timing UDP responders.
 //!
@@ -315,7 +315,12 @@ impl Session {
     }
 
     /// Receiver volume 0..100 % → dBFS (C++ `setVolume`). Stored when
-    /// not streaming and pushed at RECORD / stream start.
+    /// not streaming and pushed at RECORD / stream start. Only ever
+    /// pushed if the caller actually calls this: no call means the
+    /// receiver's own current volume is left untouched (the C++ briefly
+    /// forced 0 dB on AP2 so muted receivers were audible by default,
+    /// which clobbered the user's volume on every playback; removed in
+    /// c1234fe on the miniaudio branch).
     pub fn set_volume(&self, pct: f64) {
         self.with_inner(|g| {
             let pct = pct.clamp(0.0, 100.0);
@@ -555,7 +560,7 @@ impl SessionInner {
         self.pending_methods.clear();
         self.pending_is_http.clear();
         self.rtsp_session.clear();
-        self.resampler = Resampler::new();
+        self.resampler.reset(); // keep the caller's input rate (C++ parity)
         self.pending_volume_db = NO_VOLUME; // never carry volume between devices
 
         self.ap2 = None;
@@ -1178,12 +1183,10 @@ impl SessionInner {
         self.send_sync_packet(true); // first sync carries the marker bit
         let id = self.every(1000, Self::on_sync_tick);
         self.sync_timer = Some(id);
-        // An AP2 receiver can sit at its own (possibly muted) default until
-        // told otherwise; if the user never set a volume, push 0 dB so
-        // audio is audible by default.
-        if self.airplay2 && self.pending_volume_db <= NO_VOLUME + 1.0 {
-            self.pending_volume_db = 0.0;
-        }
+        // Never invent a volume on the receiver's behalf: if the caller
+        // didn't call set_volume(), leave the receiver's own current volume
+        // untouched (same policy for AP1 and AP2; see the set_volume doc in
+        // this file / the C++ header).
         if self.pending_volume_db > NO_VOLUME + 1.0 {
             self.send_volume();
         }
@@ -2251,6 +2254,44 @@ mod tests {
 
     // ── AP1 ────────────────────────────────────────────────────────────
 
+    /// Regression: the CLI calls `set_input_format` BEFORE `start()`, and
+    /// `start()` must not wipe the resampler's input rate (the C++
+    /// `inputRate_` survives `start()`). A wiped rate makes the lerp emit
+    /// the first buffered frame forever — audible as total silence on a
+    /// real receiver (48 kHz WAV on the Roku).
+    #[test]
+    fn ap1_input_format_set_before_start_is_kept() {
+        let (m, s, events) = harness();
+        let ring = Rc::new(RefCell::new(RingBuffer::new(8192)));
+        let samples: Vec<i16> = (0..FRAMES_PER_PACKET * CHANNELS)
+            .map(|i| (i as i16).wrapping_mul(7))
+            .collect();
+        assert!(ring.borrow_mut().try_push(&samples));
+        s.attach_ring(ring);
+        s.set_input_format(44100); // the CLI order: format BEFORE start()
+        let rtsp = start_ap1(&m, &s);
+
+        ap1_handshake_to_streaming(&m, &s, rtsp);
+
+        assert_launched(&events, true, "");
+        assert_eq!(s.state_for_test(), SessionState::Streaming);
+
+        // First pacer burst: the packets must carry the ring's samples
+        // (pass-through), not a constant first frame.
+        s.backdate_clock_for_test(Duration::from_millis(100));
+        m.fire_only_repeating_timer();
+        let audio = m.udp_tx(5001);
+        assert!(!audio.is_empty());
+        assert_eq!(audio[0][0], 0x80);
+        for i in 0..4 {
+            let v = (i as i16).wrapping_mul(7) as u16;
+            assert_eq!(audio[0][12 + 2 * i..12 + 2 * i + 2], v.to_be_bytes());
+        }
+        // And the ring was drained by the resampler (not left full).
+        let syncs = m.udp_tx(6001);
+        assert!(!syncs.is_empty());
+    }
+
     #[test]
     fn ap1_full_flow_streams_syncs_and_paces() {
         let (m, s, events) = harness();
@@ -2803,16 +2844,36 @@ mod tests {
         assert_launched(&events, true, "");
         assert_eq!(s.state_for_test(), SessionState::Streaming);
 
-        // AP2 default volume: 0 dB pushed once streaming (frame ctr 4).
-        let vol = m.last_tcp();
-        let vol_plain = dec_frame(&send, ctr, &vol);
-        assert!(String::from_utf8_lossy(&vol_plain).ends_with("volume: 0.000000"));
+        // No set_volume call anywhere in this test: the receiver's volume
+        // must be left untouched, i.e. NO "volume:" SET_PARAMETER may be
+        // sent on the handshake or at stream start (the C++ used to invent
+        // 0 dB for AP2 so muted receivers were audible by default, which
+        // clobbered the receiver's own volume on every playback; removed
+        // in c1234fe on the miniaudio branch).
+        // The pairing exchanges rode the same TCP connection in plaintext
+        // (ASCII HTTP method, so byte 1 is a letter); encrypted control
+        // frames start with a 16-bit length whose HIGH byte is 0..=3
+        // (chunks are ≤ 1024 B). The send nonce restarted at 0 when the
+        // channel keyed up, so walk it from 0.
+        let mut send_ctr = 0u64;
+        for f in m.tcp_tx() {
+            if f.get(1).is_none_or(|b| *b > 3) {
+                continue; // plaintext pairing HTTP
+            }
+            let plain = dec_frame(&send, send_ctr, &f);
+            send_ctr += 1;
+            assert!(
+                !plain.windows(8).any(|w| w == b"volume: "),
+                "unexpected volume push: {plain:?}"
+            );
+        }
 
         // Audio: encrypted ALAC (12 header + 1412 ALAC + 16 tag + 8
         // nonce) to the data port; sync to the control port. Audio flows
         // on the first pacer tick; backdate the clock for that, which
-        // also fires the 2 s feedback timer once (its POST is the final
-        // TCP send → frame ctr+1).
+        // also fires the 2 s feedback timer once (its POST is the next
+        // TCP send → frame ctr; no volume frame intervened since the
+        // no-volume push policy landed).
         assert!(m.has_timer_with_period(2000), "AP2 feedback timer armed");
         s.backdate_clock_for_test(Duration::from_millis(100));
         m.fire_only_repeating_timer(); // sync + pacer + feedback
@@ -2825,7 +2886,7 @@ mod tests {
 
         // AP2 feedback: POST /feedback RTSP/1.0.
         let last = m.last_tcp();
-        let plain = dec_frame(&send, ctr + 1, &last);
+        let plain = dec_frame(&send, ctr, &last);
         assert!(
             plain.starts_with(b"POST /feedback RTSP/1.0\r\nCSeq:".as_slice()),
             "RTSP feedback, got {plain:?}"

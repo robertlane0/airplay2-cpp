@@ -1,0 +1,18 @@
+[package]
+name = "airplay-send"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The CLI demo: raop-sender + posix-transport + mdns-browser wired together (migration of example/airplay_send.cpp)"
+
+[dependencies]
+ctrlc = { workspace = true }
+mdns-browser = { path = "../mdns-browser" }
+posix-transport = { path = "../posix-transport" }
+raop-sender = { path = "../raop-sender" }
+ring-buffer = { path = "../ring-buffer" }
+transport = { workspace = true }
+
+[lints]
+workspace = true

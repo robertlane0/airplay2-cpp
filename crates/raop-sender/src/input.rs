@@ -49,6 +49,17 @@ impl Resampler {
         self.input_rate = if sample_rate > 0 { sample_rate } else { 48000 };
     }
 
+    /// `RaopSender::start()`'s resampler reset: drop the staging buffer
+    /// and rebase the phase, but KEEP the configured input rate (the C++
+    /// `inputRate_` member survives `start()`, only `srcPhase_`,
+    /// `inBuf_` and `inReadFrames_` are cleared there). Resetting the
+    /// rate would make `fill` emit the first buffered frame forever (a
+    /// step of 0 never advances the phase and never drains the ring).
+    pub fn reset(&mut self) {
+        self.phase = 0.0;
+        self.in_buf.clear();
+    }
+
     /// The device rate in effect (after any 0 → 48000 mapping).
     pub fn input_rate(&self) -> u32 {
         self.input_rate
@@ -280,6 +291,36 @@ mod tests {
         let mut rs = Resampler::new();
         rs.set_input_format(0);
         assert_eq!(rs.input_rate(), 48000);
+    }
+
+    #[test]
+    fn reset_keeps_input_rate_and_staging_is_cleared() {
+        // Regression: `start()` used to rebuild the resampler, wiping the
+        // caller's input rate to 0. With a 0 rate the lerp's step is 0,
+        // the phase never advances, and `fill` emits the first buffered
+        // frame forever without ever draining the ring (the Roku played
+        // a constant DC sample → silence).
+        let mut rs = Resampler::new();
+        rs.set_input_format(48000);
+        let mut ring = ring_with(&(0..20_000i16).collect::<Vec<_>>());
+        let mut dst = [0i16; 704];
+        rs.fill(&mut dst, FRAMES_PER_PACKET, Some(&mut ring));
+        let before = ring.available_read();
+        assert!(before < 20_000, "fill consumed the ring");
+
+        rs.reset();
+        assert_eq!(rs.input_rate(), 48000, "reset keeps the input rate");
+        assert!(rs.in_buf.is_empty());
+
+        // Still resamples: output is not a single constant frame, and the
+        // ring keeps draining.
+        let mut dst = [0i16; 704];
+        assert_eq!(rs.fill(&mut dst, FRAMES_PER_PACKET, Some(&mut ring)), 352);
+        assert!(
+            dst.windows(2).any(|w| w[0] != w[1]),
+            "resampled audio varies (not a constant first frame)"
+        );
+        assert!(ring.available_read() < before, "ring drains across resets");
     }
 
     #[test]

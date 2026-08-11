@@ -17,7 +17,7 @@ Makefile
 *.ilk
 *.exp
 *.wav
-airplay-send
+/airplay-send
 # rust
 /target/
 Cargo.lock
