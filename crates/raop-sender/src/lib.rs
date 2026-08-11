@@ -24,12 +24,17 @@
 //!   timing reply (0xD3);
 //! * [`input`] — the input pipeline (`fillFrames_`): pass-through and
 //!   linear-interpolation resampler with bounded staging + compaction,
-//!   and the pure pacer token bucket (`onPacerTick_`).
+//!   and the pure pacer token bucket (`onPacerTick_`);
+//! * [`session`] — the `RaopSender` state machine over the `transport`
+//!   trait: `start`/`stop`, the auth/pairing chain, the AP2 flow (info →
+//!   session SETUP → event channel + RECORD → stream SETUP), digest,
+//!   streaming (sync/pacer/feedback, encrypted control + event
+//!   channels, volume/metadata), and the retransmit/timing UDP
+//!   responders.
 //!
-//! The sender state machine (the `RaopSender` struct over the
-//! `transport` trait), the audio path (pacers, resampler, ALAC encoder,
-//! RTP/SYNC packets, retransmit/timing servers) and the mock-transport
-//! session tests land in the next slices.
+//! The remaining slice is the host-side audio path (`airplay-send`: the
+//! `PcmStreamServer` + `RtspSession` hosts over `posix-transport`) and
+//! then C++ removal.
 //!
 //! ### Behavior notes vs the C++ (all documented deviations)
 //!
@@ -51,6 +56,7 @@ pub mod input;
 pub mod pairing;
 pub mod plists;
 pub mod rtsp;
+pub mod session;
 pub mod stream;
 pub mod util;
 
