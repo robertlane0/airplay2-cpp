@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#![deny(unsafe_code)]
 //! mDNS/DNS-SD browser for AirPlay receivers — migration of
 //! `src/mdns_browser.{h,cpp}`.
 //!

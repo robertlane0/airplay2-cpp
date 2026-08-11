@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#![deny(unsafe_code)]
 //! The crypto + wire-format bytes AirPlay 2 pairing needs.
 //!
 //! Rust 2024 migration of [`src/airplay_crypto.{h,cpp}`](../../src/airplay_crypto.h).

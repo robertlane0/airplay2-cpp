@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#![deny(unsafe_code)]
 //! The network + timer abstraction a RAOP sender talks to.
 //!
 //! Rust 2024 migration of [`src/transport.h`](../../src/transport.h), the

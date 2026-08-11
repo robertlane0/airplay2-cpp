@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#![deny(unsafe_code)]
 //! The default `transport::Transport`: plain `poll(2)` + BSD sockets.
 //!
 //! Rust 2024 migration of [`src/posix_transport.{h,cpp}`](../../src/posix_transport.h).

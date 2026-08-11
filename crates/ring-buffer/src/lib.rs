@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#![deny(unsafe_code)]
 //! A copy-in/copy-out ring buffer.
 //!
 //! Rust 2024 migration of [`src/ring_buffer.h`](../../src/ring_buffer.h).

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#![deny(unsafe_code)]
 //! The pure protocol layer of the AirPlay RAOP sender — the first slice
 //! of the [`src/raop_sender.{h,cpp}`](https://github.com/fxchain/cast/raw/…) migration.
 //!

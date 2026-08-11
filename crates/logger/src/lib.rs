@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#![deny(unsafe_code)]
 //! The smallest logging sink that could work.
 //!
 //! Rust 2024 migration of [`src/logger.h`](../../src/logger.h) (C++ original
