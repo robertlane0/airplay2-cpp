@@ -9,7 +9,7 @@
 //!   `[warn] msg` to stderr.
 //! * `Log::setSink` replaces the sink. There is no way back to the default
 //!   sink (same as C++).
-//! * Messages are `"{}"`-placeholder formatted (see [`format`]).
+//! * Messages are `"{}"`-placeholder formatted (see [`crate::format`]).
 //!
 //! Deliberate, documented differences from the C++:
 //!
@@ -17,12 +17,12 @@
 //!   macros, which delegate to [`std::format!`]. An arity mismatch is a
 //!   compile-time error in Rust instead of silently ignoring extra arguments
 //!   or leaving the placeholder in place. For dynamically built format
-//!   strings, [`format`] keeps the exact C++ behavior (replace successive
+//!   strings, `format` keeps the exact C++ behavior (replace successive
 //!   `{}` left to right; missing placeholder returns the string unchanged).
 //! * The C++ sink is an unsynchronized function-local static; in Rust the
 //!   sink lives behind a `Mutex` so `set_sink` and logging are thread-safe
 //!   (the C++ version was a data race if both happened concurrently).
-//! * A sink must not recursively log through [`info`]/[`warn`] (documented
+//! * A sink must not recursively log through the `info!`/`warn!` macros (documented
 //!   divergence; pathological in the C++ too).
 //!
 //! ```

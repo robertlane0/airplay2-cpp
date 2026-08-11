@@ -403,7 +403,7 @@ impl Session {
         // back.
         let cbs = {
             let mut g = self.inner.borrow_mut();
-            std::mem::replace(&mut g.callbacks, Callbacks::default())
+            std::mem::take(&mut g.callbacks)
         };
         cbs.fire_one(evs);
         let mut g = self.inner.borrow_mut();
@@ -413,7 +413,7 @@ impl Session {
 
 impl Default for Callbacks {
     /// No-op hooks; used while the real callbacks are swapped out during
-    /// [`Session::fire`] and the `dispatch` helper (and as a placeholder
+    /// `Session::fire` and the `dispatch` helper (and as a placeholder
     /// default).
     fn default() -> Self {
         Callbacks {
@@ -461,7 +461,7 @@ fn dispatch(me: &Weak<RefCell<SessionInner>>, f: impl FnOnce(&mut SessionInner) 
         return;
     }
     let mut g = s.borrow_mut();
-    let cbs = std::mem::replace(&mut g.callbacks, Callbacks::default());
+    let cbs = std::mem::take(&mut g.callbacks);
     drop(g);
     cbs.fire_one(evs);
     let mut g = s.borrow_mut();
@@ -1825,7 +1825,7 @@ impl SessionInner {
                 Vec::new(),
             );
         }
-vec![]
+        vec![]
     }
 }
 // ── tests ──────────────────────────────────────────────────────────────
@@ -2479,7 +2479,11 @@ mod tests {
         m.fire_data(rtsp, &rep); // M2 desires a PIN → on_pin_required
         assert!(events.borrow().contains(&"pin-callback-ran".to_string()));
         assert_eq!(
-            events.borrow().iter().filter(|e| *e == "pin-callback-ran").count(),
+            events
+                .borrow()
+                .iter()
+                .filter(|e| *e == "pin-callback-ran")
+                .count(),
             1,
             "callback ran exactly once"
         );

@@ -14,7 +14,7 @@
 //!   catch up without flooding the LAN.
 //!
 //! The ring itself, the pacing timer and the RTP send stay with the
-//! state-machine slice; [`pacing`] only decides the counts.
+//! state-machine slice; `pacing` only decides the counts.
 
 use ring_buffer::RingBuffer;
 
