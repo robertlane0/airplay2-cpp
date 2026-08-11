@@ -8,11 +8,13 @@ members = [
     "crates/airplay-crypto",
     "crates/mdns-browser",
     "crates/raop-sender",
+    "crates/airplay-send",
 ]
 
 [workspace.dependencies]
 nix = { version = "0.29", features = ["poll", "socket", "net"] }
 transport = { path = "crates/transport" }
+ctrlc = "3"
 
 [workspace.package]
 edition = "2024"

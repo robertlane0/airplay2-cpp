@@ -396,9 +396,46 @@ impl Session {
         if evs.is_empty() {
             return;
         }
-        let g = self.inner.borrow();
+        // Callbacks may re-enter ANY public `Session` method (the C++
+        // demo blocks inside `on_pin_required` and calls `submit_pin`),
+        // so they must run with no `inner` borrow held at all. Swap the
+        // callbacks out for no-ops under one short borrow, run, swap
+        // back.
+        let cbs = {
+            let mut g = self.inner.borrow_mut();
+            std::mem::replace(&mut g.callbacks, Callbacks::default())
+        };
+        cbs.fire_one(evs);
+        let mut g = self.inner.borrow_mut();
+        g.callbacks = cbs;
+    }
+}
+
+impl Default for Callbacks {
+    /// No-op hooks; used while the real callbacks are swapped out during
+    /// [`Session::fire`] and the `dispatch` helper (and as a placeholder
+    /// default).
+    fn default() -> Self {
+        Callbacks {
+            on_launched: Box::new(|_, _| {}),
+            on_closed: Box::new(|| {}),
+            on_pin_required: Box::new(|_| {}),
+            on_credentials_obtained: Box::new(|_, _| {}),
+        }
+    }
+}
+
+impl Callbacks {
+    fn fire_one(&self, evs: Vec<Deferred>) {
         for e in evs {
-            g.fire_one(e);
+            match e {
+                Deferred::Launched(ok, why) => (self.on_launched)(ok, &why),
+                Deferred::Closed => (self.on_closed)(),
+                Deferred::PinRequired(name) => (self.on_pin_required)(&name),
+                Deferred::CredentialsObtained(id, creds) => {
+                    (self.on_credentials_obtained)(&id, &creds)
+                }
+            }
         }
     }
 }
@@ -423,10 +460,12 @@ fn dispatch(me: &Weak<RefCell<SessionInner>>, f: impl FnOnce(&mut SessionInner) 
     if evs.is_empty() {
         return;
     }
-    let g = s.borrow();
-    for e in evs {
-        g.fire_one(e);
-    }
+    let mut g = s.borrow_mut();
+    let cbs = std::mem::replace(&mut g.callbacks, Callbacks::default());
+    drop(g);
+    cbs.fire_one(evs);
+    let mut g = s.borrow_mut();
+    g.callbacks = cbs;
 }
 
 impl SessionInner {
@@ -486,17 +525,6 @@ impl SessionInner {
             np_cover: Vec::new(),
             np_cover_mime: String::new(),
             ap2: None,
-        }
-    }
-
-    fn fire_one(&self, e: Deferred) {
-        match e {
-            Deferred::Launched(ok, why) => (self.callbacks.on_launched)(ok, &why),
-            Deferred::Closed => (self.callbacks.on_closed)(),
-            Deferred::PinRequired(name) => (self.callbacks.on_pin_required)(&name),
-            Deferred::CredentialsObtained(id, creds) => {
-                (self.callbacks.on_credentials_obtained)(&id, &creds)
-            }
         }
     }
 
@@ -1797,7 +1825,7 @@ impl SessionInner {
                 Vec::new(),
             );
         }
-        vec![]
+vec![]
     }
 }
 // ── tests ──────────────────────────────────────────────────────────────
@@ -2411,6 +2439,54 @@ mod tests {
         m.fire_connect(rtsp);
         m.fire_data(rtsp, b"RTSP/1.0 401 Unauthorized\r\n\r\n");
         assert_launched(&events, false, "The device requires a password");
+    }
+
+    #[test]
+    fn callbacks_may_reenter_session_methods() {
+        // The CLI demo blocks inside `on_pin_required` and calls
+        // `submit_pin` (C++ `submitPin` from the callback). Callbacks must
+        // therefore run with NO inner borrow held: the fire/dispatch paths
+        // swap the callbacks out, invoke with zero borrows, and swap back.
+        let m = Rc::new(MockTransport::default());
+        let events: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let ev = events.clone();
+        let holder: Rc<RefCell<Option<Session>>> = Rc::new(RefCell::new(None));
+        let h2 = holder.clone();
+        let s = Session::new(
+            m.clone(),
+            Callbacks {
+                on_launched: Box::new(|_, _| {}),
+                on_closed: Box::new(|| {}),
+                on_pin_required: Box::new(move |_n: &str| {
+                    // Re-entrant: the demo pattern (submit_pin from inside
+                    // the callback) must not panic on the RefCell.
+                    h2.borrow().as_ref().expect("holder set").submit_pin("1234");
+                    ev.borrow_mut().push("pin-callback-ran".to_string());
+                }),
+                on_credentials_obtained: Box::new(|_, _| {}),
+            },
+        );
+        *holder.borrow_mut() = Some(s.clone());
+        s.set_auth(Auth::HapPin, true, "dev-1", "", "");
+        s.start("192.0.2.1", 7000, "test-device");
+        let rtsp = m.tcp_handles()[0];
+        m.fire_connect(rtsp);
+        m.fire_data(rtsp, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"); // pin-start 200
+        let mut m2 = tlv(0x02, b"fake-salt");
+        m2.extend(tlv(0x03, &[0xCDu8; 64]));
+        let mut rep = b"HTTP/1.1 200 OK\r\nContent-Length: 77\r\n\r\n".to_vec();
+        rep.extend_from_slice(&m2);
+        m.fire_data(rtsp, &rep); // M2 desires a PIN → on_pin_required
+        assert!(events.borrow().contains(&"pin-callback-ran".to_string()));
+        assert_eq!(
+            events.borrow().iter().filter(|e| *e == "pin-callback-ran").count(),
+            1,
+            "callback ran exactly once"
+        );
+        // The submit_pin from inside the callback actually took: the
+        // machine is replying to M2 with the PIN-derived M3 (transient =
+        // not waiting any more).
+        assert!(!s.waiting_for_pin());
     }
 
     #[test]
