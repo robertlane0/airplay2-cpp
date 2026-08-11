@@ -8,6 +8,7 @@ description = "AirPlay RAOP sender protocol layer: RTSP/HTTP wire, HAP pairing, 
 
 [dependencies]
 airplay-crypto = { path = "../airplay-crypto" }
+ring-buffer = { path = "../ring-buffer" }
 
 [lints]
 workspace = true

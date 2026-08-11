@@ -21,7 +21,10 @@
 //! * [`stream`] — the RAOP UDP packet layer: RTP audio packets (AP1
 //!   big-endian s16 / AP2 uncompressed-ALAC + ChaCha20-Poly1305), the
 //!   SYNC packet (0x54), retransmit handling (0x55 → 0xD6) and the NTP
-//!   timing reply (0xD3).
+//!   timing reply (0xD3);
+//! * [`input`] — the input pipeline (`fillFrames_`): pass-through and
+//!   linear-interpolation resampler with bounded staging + compaction,
+//!   and the pure pacer token bucket (`onPacerTick_`).
 //!
 //! The sender state machine (the `RaopSender` struct over the
 //! `transport` trait), the audio path (pacers, resampler, ALAC encoder,
@@ -44,6 +47,7 @@
 //! * Some panic-free hardening where the C++ relies on
 //!   fixed-length crypto inputs (checked `try_into` conversions).
 
+pub mod input;
 pub mod pairing;
 pub mod plists;
 pub mod rtsp;

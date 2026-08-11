@@ -247,6 +247,18 @@ multi-record resolution path.
   `sendAudioPacket_`/`sendSyncPacket_`/`onControlData_`/
   `onTimingData_`/`encodeAlacFrame_` (src/raop_sender.cpp:1825, 2006,
   2027, 2051, 1867).
+- **`input` module (2026-08-10).** 11 tests: `Resampler` (`fillFrames_`)
+  pass-through pop-and-pad, 88200 → every-other-frame, 22050 →
+  interpolated midpoints with phase rebase + left-neighbour compaction,
+  starvation → silence (the lerp demands its right neighbour even at
+  frac = 0, per the C++ `i0 + 1 >= bufFrames` guard), `kInBufMaxFrames`
+  top-up bound, 0 → 48000 mapping, no-ring silence path; and the pure
+  pacer: `target_frames` boundary (352 frames need ≥ 352·10⁹/44100 ns),
+  whole-block counting, cap 16. During testing a real bug was caught:
+  the first `pending_packets` translation re-read the ORIGINAL
+  `frames_sent` in the loop condition (C++ re-reads the growing value),
+  returning 16 everywhere; fixed with the closed form
+  `min(cap, (target − frames_sent)/FRAMES_PER_PACKET)`.
 - **Remaining.** The `RaopSender` state machine over the `transport`
   trait (session flow, pacer token bucket, resampler, ring input),
   mock-transport integration tests, then the `airplay-send` example /
